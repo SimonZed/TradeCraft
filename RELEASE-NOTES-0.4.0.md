@@ -22,4 +22,4 @@ The charting library has been updated with improvements to built-in studies, dra
 
 ## Release status
 
-TradeCraft remains a read-only alpha. The Windows personal and community editions maintain separate provider preferences. Mac builds and interactive platform behavior require validation for this revision. Provider distribution rights, upstream provenance and third-party notice questions remain documented in the project records; no blanket compliance clearance is implied.
+TradeCraft remains a read-only alpha. The Windows personal and community editions maintain separate provider preferences. Both Mac architectures passed automated builds, but interactive Mac testing remains outstanding; the apps are unsigned and not notarized. Provider distribution rights, upstream provenance and third-party notice questions remain documented in the project records; no blanket compliance clearance is implied.
