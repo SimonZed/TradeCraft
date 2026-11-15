@@ -683,6 +683,22 @@ mod tests {
     use super::*;
     use egui_charts::data::{Datafeed, HistoryPage, HistoryRequest, Reply};
     use egui_kittest::kittest::Queryable;
+
+    struct EmptyOptionsTestStorage;
+    impl egui_charts::services::Storage for EmptyOptionsTestStorage {
+        fn list(&self, _: egui_charts::services::StoreKind, reply: Reply<Vec<String>>) { reply.send(Ok(vec![])); }
+        fn load(&self, _: egui_charts::services::StoreKind, _: &str, reply: Reply<Option<String>>) { reply.send(Ok(None)); }
+        fn save(&self, _: egui_charts::services::StoreKind, _: &str, _: String, reply: Reply<()>) { reply.send(Ok(())); }
+        fn delete(&self, _: egui_charts::services::StoreKind, _: &str, reply: Reply<()>) { reply.send(Ok(())); }
+    }
+
+    fn isolated_options_test_app() -> TerminalApp {
+        let mut app = TerminalApp::new();
+        let placeholder = Terminal::new(app.feed.clone());
+        app.terminal = std::mem::replace(&mut app.terminal, placeholder)
+            .with_storage(Arc::new(EmptyOptionsTestStorage));
+        app
+    }
     #[test]
     fn quit_never_times_out_into_discarding_pending_saves() {
         let start = Instant::now();
@@ -1737,11 +1753,11 @@ mod tests {
     }
     #[test]
     fn option_chart_tab_displays_readable_contract_name() {
-        let mut app = TerminalApp::new();
-        app.terminal.chart_mut().set_symbol("SPY261116C00755000");
         let mut h = egui_kittest::Harness::builder()
             .with_size(egui::vec2(1400.0, 800.0))
-            .build_ui_state(|ui, app: &mut TerminalApp| app.show_ui(ui), app);
+            .build_ui_state(|ui, app: &mut TerminalApp| app.show_ui(ui), isolated_options_test_app());
+        h.run_steps(3);
+        h.state_mut().terminal.chart_mut().set_symbol("SPY261116C00755000");
         h.run_steps(3);
         assert!(h.query_by_label("SPY 755C").is_some());
         assert_eq!(h.state().terminal.chart().symbol(), "SPY261116C00755000");
@@ -1749,12 +1765,13 @@ mod tests {
 
     #[test]
     fn options_toolbar_opens_for_active_instrument() {
-        let mut app = TerminalApp::new();
+        let mut app = isolated_options_test_app();
         app.settings.provider = Provider::Yahoo;
-        app.terminal.chart_mut().set_symbol("SPY");
         let mut h = egui_kittest::Harness::builder()
             .with_size(egui::vec2(1400.0, 800.0))
             .build_ui_state(|ui, app: &mut TerminalApp| app.show_ui(ui), app);
+        h.run_steps(3);
+        h.state_mut().terminal.chart_mut().set_symbol("SPY");
         h.run_steps(3);
         h.get_by_label("Options").click();
         h.run_steps(3);

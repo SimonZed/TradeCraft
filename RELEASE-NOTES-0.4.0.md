@@ -8,7 +8,7 @@ With Tradier selected, open **Options** from a chart or a watchlist symbol. Choo
 
 Choose which optional columns to display and keep those preferences between sessions. The chain shows the underlying price among the strikes and presents per-share prices alongside their ×100 amounts for convenient comparison.
 
-The chain is a manually refreshed snapshot. Availability depends on the Tradier account and provider; the ×100 display is before fees and adjusted contracts may differ. Live Tradier options data and contract charts still require verification.
+The chain is a manually refreshed snapshot. Availability depends on the Tradier account and provider; the ×100 display is before fees and adjusted contracts may differ. A live SPY chain and one contract's daily and five-minute history were checked; the complete interactive workflow and broader coverage still need verification.
 
 ## Pine indicators
 
