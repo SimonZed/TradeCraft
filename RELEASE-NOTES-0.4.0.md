@@ -1,4 +1,4 @@
-# TradeCraft 0.4.0 alpha — release candidate
+# TradeCraft 0.4.0 alpha
 
 TradeCraft 0.4.0 adds a read-only options workflow, expands custom Pine indicator support and updates the charting library with new indicator and chart controls.
 

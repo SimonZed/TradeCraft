@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.0 — alpha
+
 - Add a read-only Tradier options chain with expiration selection, calls and puts, configurable columns, quotes and available Greeks; open a contract in a chart tab.
 - Improve Pine indicator support, including lower-timeframe requests, session flags and historical prior-day values. Compatibility and live behavior still need verification.
 - Update the vendored egui-charts main branch to `7a852a5`, including upstream chart and study improvements, while retaining TradeCraft's provider, Pine and chart interaction changes. Both macOS architectures passed automated builds; interactive validation remains pending.
