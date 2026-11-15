@@ -3,7 +3,6 @@
 use super::super::ChartMapping;
 use crate::scales::{PriceMap, PriceRange, PriceTransform};
 use crate::studies::{Indicator, PlotType, StudyScale};
-use crate::theme::ThemeExt;
 use egui::{Align2, Painter, Pos2, Rect};
 
 /// Keep independent study units out of the main price map, including hidden scales.
@@ -106,7 +105,9 @@ pub(crate) fn fit_study_mapping(
     }
 }
 
-/// Paint an independent study axis in its reserved gutter beside the plot.
+/// Paint an independent study axis in its reserved gutter beside the plot. Each label is in
+/// `text`, or in the colour that reads on its tag, on a plate in the colour `background` gives
+/// for the chart background behind it.
 pub(crate) fn render_study_axis(
     painter: &Painter,
     studies: &[&dyn Indicator],
@@ -114,12 +115,13 @@ pub(crate) fn render_study_axis(
     axis: Rect,
     axis_options: &crate::config::PriceAxisOptions,
     relative_formatter: Option<&dyn crate::scales::PriceFormatter>,
+    text: egui::Color32,
+    background: &dyn Fn(Pos2) -> egui::Color32,
 ) -> f32 {
     let Some(&study) = studies.first() else {
         return 0.0;
     };
     let painter = painter.with_clip_rect(axis);
-    let theme = painter.ctx().active_theme();
     let font = crate::chart::rendering::axes::axis_font(painter.ctx());
     let (x, align) = if axis.left() >= coords.rect.right() {
         (axis.left() + 8.0, Align2::LEFT_CENTER)
@@ -128,11 +130,12 @@ pub(crate) fn render_study_axis(
     };
     let mut width = 0.0_f32;
     let mut labels = Vec::new();
+    let last_in_view = super::last_bar_in_view(coords);
     for &member in studies {
         if !axis_options.show_study_values {
             continue;
         }
-        let Some(bar) = member.values().len().checked_sub(1) else {
+        let Some(bar) = super::study_tag_bar(member, last_in_view) else {
             continue;
         };
         for line in 0..member.line_count() {
@@ -189,9 +192,7 @@ pub(crate) fn render_study_axis(
         let galley = painter.layout_no_wrap(
             label,
             font.clone(),
-            color.map_or(theme.chart.axis_text, |color| {
-                crate::chart::rendering::axes::tag_text_color(color)
-            }),
+            color.map_or(text, crate::chart::rendering::axes::tag_text_color),
         );
         let rect = align
             .anchor_size(Pos2::new(x, y), galley.size())
@@ -203,12 +204,12 @@ pub(crate) fn render_study_axis(
         {
             continue;
         }
-        painter.rect_filled(rect, 0.0, color.unwrap_or(theme.chart.bg));
-        painter.galley(
-            rect.min + egui::vec2(2.0, 2.0),
-            galley,
-            theme.chart.axis_text,
+        painter.rect_filled(
+            rect,
+            0.0,
+            color.unwrap_or_else(|| background(rect.center())),
         );
+        painter.galley(rect.min + egui::vec2(2.0, 2.0), galley, text);
         occupied.push(rect);
     }
     width
@@ -287,6 +288,8 @@ mod tests {
                         axis,
                         &Default::default(),
                         None,
+                        egui::Color32::WHITE,
+                        &|_| egui::Color32::BLACK,
                     );
                 }
             });

@@ -3,6 +3,7 @@
 mod background;
 mod sessions;
 
+pub(super) use background::{background_at, paint_background};
 #[cfg(feature = "studies")]
 pub(super) use sessions::session_ranges;
 
@@ -218,6 +219,7 @@ impl Chart {
         self.sync_volume_study(ui.ctx());
         #[cfg(feature = "drawings")]
         self.sync_stored_drawings(ui.ctx());
+        self.frame_clock = Some(super::change_marks::FrameClock::shown_in(ui.ctx()));
         self.pump(ui.ctx());
         if let Some(wait) = self.refresh_studies(ui.input(|i| i.time)) {
             ui.ctx()
@@ -359,11 +361,14 @@ impl Chart {
                     .time_scale
                     .lock_visible_time_range_on_resize)
                 && previous_axis_width > 0.0
-                && old_width > 0.0
-                && new_width > 0.0
+                && old_width >= 2.0
+                && new_width >= 2.0
             {
-                let scale = self.state.time_scale_mut();
-                scale.set_bar_spacing(scale.bar_spacing() * new_width / old_width);
+                self.state
+                    .time_scale_mut()
+                    .keep_slots_on_resize(old_width, new_width);
+                // The rerun pass must not resize the scale again from the old width.
+                self.prev_width = Some(new_width);
             }
             ui.ctx().request_discard("Chart measured its axis labels");
         }
@@ -585,8 +590,10 @@ impl Chart {
         });
         // A button owns the whole gesture, including a drag that leaves the row. The chart's
         // own response goes back to the caller; the gesture handlers see a hover-only one.
-        let mut shown =
-            shared_plot.map_or_else(|| response.clone(), |plot| response.union(plot.clone()));
+        // The other panes stand in for a price frame without height in what the caller gets.
+        let mut shown = shared_plot
+            .filter(|_| rect.height() == 0.0)
+            .map_or_else(|| response.clone(), |plot| response.union(plot.clone()));
         if self.pane_collapse_click(ui.ctx()) {
             response.flags.remove(egui::response::Flags::CLICKED);
             shown.flags.remove(egui::response::Flags::CLICKED);
@@ -618,7 +625,7 @@ impl Chart {
         #[cfg(not(feature = "drawings"))]
         let drawing_tool_active = false;
         #[cfg(not(feature = "drawings"))]
-        let is_drawing_interaction = false;
+        let (is_drawing_interaction, drawing_gesture) = (false, false);
         #[cfg(feature = "drawings")]
         if self.drawings.selection_area().is_some_and(|area| {
             area.pane
@@ -629,10 +636,12 @@ impl Chart {
                 self.drawings.end_selection_area();
             }
         }
+        // A Ctrl or Command press on empty space arms a selection area, which only a drag starts.
+        #[cfg(feature = "drawings")]
+        let box_selection = self.drawings.box_selection_input(ui);
         // The Magic cursor marks while the button is held, so a drag paints rather than pans.
         #[cfg(feature = "drawings")]
-        let is_drawing_interaction = self.drawings.box_selection_input(ui)
-            || self.drawings.active_tool.is_some()
+        let drawing_gesture = self.drawings.active_tool.is_some()
             || self.chart_options.crosshair.style == crate::config::CrosshairStyle::Magic
             || self.drawings.dragging_handle.is_some()
             || self.drawings.text_editor.is_some()
@@ -650,6 +659,8 @@ impl Chart {
                                 .any(|d| d.id == id && !d.locked)
                         })
                 });
+        #[cfg(feature = "drawings")]
+        let is_drawing_interaction = box_selection || drawing_gesture;
         let show_price_button =
             self.config.show_plus_button && !eraser_mode && !is_drawing_interaction;
         let show_axis_settings = !self.layout_inactive || ui.rect_contains_pointer(rect);
@@ -680,21 +691,16 @@ impl Chart {
                                 .or(input.pointer.hover_pos())
                                 .is_some_and(|pos| axis_corner.contains(pos))
                     })));
-        let hover_rect = shared_plot.map_or_else(
-            || {
-                Rect::from_min_max(
-                    Pos2::new(
-                        chart_rect.left(),
-                        self.pane_layout
-                            .panes
-                            .iter()
-                            .map(|pane| pane.rect.top())
-                            .fold(chart_rect.top(), f32::min),
-                    ),
-                    Pos2::new(chart_rect.right(), time_axis_top),
-                )
-            },
-            |plot| plot.rect,
+        let hover_rect = Rect::from_min_max(
+            Pos2::new(
+                chart_rect.left(),
+                self.pane_layout
+                    .panes
+                    .iter()
+                    .map(|pane| pane.rect.top())
+                    .fold(chart_rect.top(), f32::min),
+            ),
+            Pos2::new(chart_rect.right(), time_axis_top),
         );
         let touch_readout_interaction = self.handle_touch_crosshair(
             ui,
@@ -743,7 +749,7 @@ impl Chart {
             response.rect = rect;
         }
 
-        // The visible pane drives time navigation even while the price pane has no height.
+        // The plots of the other panes drive time navigation as the price plot does.
         let mut time_response =
             shared_plot.map_or_else(|| response.clone(), |plot| response.union(plot.clone()));
         time_response.flags.remove(readout_flags);
@@ -797,13 +803,23 @@ impl Chart {
         );
 
         // Handle double-click to reset axes
-        self.handle_double_click(&time_response, price_axis_rect, time_axis_rect);
+        self.handle_double_click(&time_response, time_axis_rect);
+
+        // The price axis: a drawing or a touch readout that owns the drag keeps it, as on the plot.
+        let mut axis_response = time_response.clone();
+        if is_drawing_interaction || touch_readout_interaction {
+            axis_response.flags.remove(egui::response::Flags::DRAGGED);
+        }
+        let price_axis_gestures = self.price_axis_gestures(ui, &axis_response, price_axis_rect);
+        if price_axis_gestures.reset {
+            self.state.price_scale_mut().reset();
+        }
 
         // Handle mouse wheel for zoom/scroll
         // Block pan/zoom when drawing tool is active OR when manipulating a drawing
         let time_based = !self.chart_type.is_time_independent();
         let show_volume = self.shows_volume();
-        let pending_price_zoom = self.handle_mouse_wheel(
+        self.handle_mouse_wheel(
             ui,
             &time_response,
             chart_width,
@@ -1126,6 +1142,17 @@ impl Chart {
             )
             .filter(|_| self.main_series_visible && time_based)
             .collect::<Vec<_>>();
+        // The newest close of a price-based chart can lie beyond its newest element. While that
+        // element is in view, the price its last price line shows is fitted with it, so that the
+        // line and its label are drawn. The newest element in view is among the fitted bars.
+        let last_price = (!time_based
+            && self.main_series_visible
+            && self.main_series_style.price_line_source == crate::model::PriceLineSource::LastBar
+            && start_idx < end_idx
+            && end_idx == self.state.shown().len())
+        .then(|| crate::model::last_with_value(&self.state.data().bars))
+        .flatten()
+        .map(|bar| bar.close);
         let heikin_ashi = (self.chart_type == crate::model::ChartType::Heikin
             && !self.state.data().is_empty())
         .then(|| {
@@ -1165,6 +1192,7 @@ impl Chart {
                 .into_iter()
                 .chain(primitive_prices)
                 .chain(target_prices)
+                .chain(last_price)
                 .chain(footprint_prices.into_iter().flatten())
                 .chain(profile_prices),
             series_values,
@@ -1343,7 +1371,12 @@ impl Chart {
                 self.fit_main_marker_scale(&painter, price_rect, main_margins);
             }
         }
-        self.apply_price_zoom(pending_price_zoom, &response, price_rect, transform);
+        // After the fit, so that a scale on automatic is zoomed from this frame's range.
+        price_axis_gestures.zoom(
+            self.state.price_scale_mut(),
+            price_rect.top(),
+            price_rect.bottom(),
+        );
         let bar_spacing = self.state.time_scale().bar_spacing();
         if self.config.lock_price_to_bar_ratio != self.last_ratio_lock {
             self.state.price_scale_mut().set_bar_ratio_locked(
@@ -1451,14 +1484,17 @@ impl Chart {
         };
 
         let timezone = self.display_timezone();
-        let time_scale = self.build_time_formatter();
+        // Sampled once: inferred spacing sorts the gaps of the bars in view.
+        let bar_seconds = self.time_label_seconds();
+        let label_timezone = self.label_timezone(|| bar_seconds);
+        let time_scale = self.time_formatter_in(label_timezone.clone());
         let host_scale = self.horizontal_scale.clone();
         let scale: &dyn crate::scales::HorizontalScale =
             host_scale.as_deref().unwrap_or(&time_scale);
         // The grid and the labels share one set of marks and the merged bars' mapping.
         let (time_marks, time_points, axis_coords) = if time_grid || self.config.show_time_labels {
             // Resolved once: a fixed-offset zone allocates on every clone.
-            let calendar = self.calendar_timezone();
+            let calendar = Self::calendar_zone(label_timezone);
             let numeric = time_coords.numeric_positions.is_some();
             rendering::time_axis_marks(
                 &RenderContext::new(&painter, chart_rect),
@@ -2008,6 +2044,7 @@ impl Chart {
             if study.is_volume()
                 && !matches!(study.scale(), crate::studies::StudyScale::Shared(_))
                 && self.main_series_visible
+                && self.chart_type.supports_volume()
                 && !self.state.data().is_empty()
             {
                 let rect = super::volume::overlay_rect(price_rect, &self.config);
@@ -2235,13 +2272,23 @@ impl Chart {
                 if let Some(table) = statistics_rect
                     && let Some((flow, config)) = host.or_else(|| feed.zip(feed_config.as_ref()))
                 {
+                    // The trading days the session breaks divide intraday bars into; a bar of a
+                    // day or longer holds one of its own.
+                    let trading_days = config.session_cumulative_delta.then(|| {
+                        exchange_session
+                            .clone()
+                            .with_timeframe(crate::model::Timeframe::Min1)
+                    });
+                    let sessions = trading_days
+                        .as_ref()
+                        .map(|days| self.session_provider.as_deref().unwrap_or(days));
                     crate::chart::overlays::render_footprint_statistics_rows(
                         &painter,
                         &self.get_chart_mapping().with_rect(table),
                         self.bars(super::SeriesId::MAIN),
                         flow,
-                        config.text_color,
-                        statistics_rows.as_deref().unwrap(),
+                        config,
+                        sessions,
                     );
                 }
                 if let Some((_, Some(volume))) = &merged {
@@ -2339,8 +2386,11 @@ impl Chart {
         // study's pane. Otherwise overlay indicators take priority over the
         // series beneath them; an empty-area click clears the selection. Clicks
         // in a study's pane are resolved where the panes are rendered, outside
-        // this rect.
+        // this rect. As there, a click with the eraser or a drawing tool keeps
+        // the selection.
         if response.clicked()
+            && !drawing_tool_active
+            && !eraser_mode
             && let Some(click_pos) = response.interact_pointer_pos()
         {
             #[cfg(feature = "drawings")]
@@ -2786,9 +2836,12 @@ impl Chart {
                     axis,
                     &study_axis,
                     None,
+                    colors.text,
+                    &|pos| self.background_at(rect, pos),
                 ));
         }
         if show_price_axis && study_axis.show_study_values {
+            let last_in_view = rendering::axes::last_bar_in_view(&coords);
             for study in studies
                 .indicators()
                 .iter()
@@ -2796,6 +2849,10 @@ impl Chart {
                 .filter(|(idx, _)| study_indices.contains(idx))
                 .map(|(_, study)| study)
             {
+                // A chart type that hides volume tags no volume value.
+                if study.is_volume() && !self.chart_type.supports_volume() {
+                    continue;
+                }
                 if study.is_volume()
                     && !matches!(study.scale(), crate::studies::StudyScale::Shared(_))
                 {
@@ -2813,6 +2870,7 @@ impl Chart {
                             price_rect,
                             &mapping.price,
                             study.as_ref(),
+                            last_in_view,
                             axis_edge,
                             &mut tags,
                             &study_axis,
@@ -2830,6 +2888,7 @@ impl Chart {
                     price_rect,
                     &price_map,
                     study.as_ref(),
+                    last_in_view,
                     axis_edge,
                     &mut tags,
                     price_formatter.as_deref(),
@@ -2985,8 +3044,6 @@ impl Chart {
             }
         }
 
-        let bar_seconds = self.time_label_seconds();
-
         // Handle drawing tools
         #[cfg(feature = "drawings")]
         {
@@ -3044,19 +3101,25 @@ impl Chart {
         #[cfg(feature = "drawings")]
         {
             let mut prices = Vec::new();
-            for tag in self
-                .drawings
-                .axis_tags(price_rect, ui.active_theme().chart.axis_text_secondary)
-            {
+            for tag in self.drawings.axis_tags(
+                price_rect,
+                ui.active_theme().chart.axis_text_secondary,
+                self.state.shown(),
+                self.state.revision(),
+            ) {
                 match tag {
-                    crate::drawings::manager::DrawingAxisTag::Price { price, color } => {
+                    crate::drawings::manager::DrawingAxisTag::Price {
+                        price,
+                        color,
+                        decimals,
+                    } => {
                         if show_price_axis
                             && price.is_finite()
                             && price_map
                                 .range()
                                 .contains(price_map.transform().to_scale(price))
                         {
-                            prices.push((price_map.price_to_y(price), price, color));
+                            prices.push((price_map.price_to_y(price), price, color, decimals));
                         }
                     }
                     crate::drawings::manager::DrawingAxisTag::Time { x, anchor, color } => {
@@ -3085,10 +3148,18 @@ impl Chart {
                 if !self.config.price_axis.allow_label_overlap {
                     ys = rendering::axes::spread_axis_ys(&painter, &ys);
                 }
-                for ((_, price, color), y) in prices.into_iter().zip(ys) {
+                for ((_, price, color, decimals), y) in prices.into_iter().zip(ys) {
                     let label = price_map.label(
                         price_map.transform().to_scale(price),
-                        rendering::axes::tag_decimals(&price_map, price_map.price_to_y(price)),
+                        decimals.map_or_else(
+                            || {
+                                rendering::axes::tag_decimals(
+                                    &price_map,
+                                    price_map.price_to_y(price),
+                                )
+                            },
+                            usize::from,
+                        ),
                         price_formatter.as_deref(),
                     );
                     tags.push(rendering::axes::render_axis_value(
@@ -3282,6 +3353,8 @@ impl Chart {
                     session_closes.filter(|_| values && self.config.show_last_day_change);
                 legend.study_backdrop = self.config.indicator_backdrop_opacity;
                 legend.extended_hours = (&extended_hours.0, extended_hours.1);
+                let background = |pos: Pos2| self.background_at(rect, pos);
+                legend.background = Some(&background);
                 let inputs: Vec<_> = self.study_inputs.iter().map(String::as_str).collect();
                 legend.study_inputs = &inputs;
                 legend.previous_close =
@@ -3526,8 +3599,7 @@ impl Chart {
                                 point,
                                 &self.chart_type_params.styles,
                                 color,
-                                self.plot_background(rect, point)
-                                    .unwrap_or(self.config.background_color),
+                                self.background_at(rect, point),
                             );
                         }
                     }
@@ -3538,10 +3610,7 @@ impl Chart {
                             item,
                             self.series_map(item, price_rect),
                             index,
-                            |point| {
-                                self.plot_background(rect, point)
-                                    .unwrap_or(self.config.background_color)
-                            },
+                            |point| self.background_at(rect, point),
                         );
                     }
                 }
@@ -3642,8 +3711,10 @@ impl Chart {
                             .study_rows_at(start_idx + local_idx)
                             .into_iter()
                             .filter(|(id, _)| {
-                                !tooltip_options.on_long_press
-                                    || tooltip_options.show_volume_details
+                                // A chart type that hides volume lists no volume rows.
+                                (self.chart_type.supports_volume()
+                                    && (!tooltip_options.on_long_press
+                                        || tooltip_options.show_volume_details))
                                     || self
                                         .study_ids
                                         .iter()
@@ -3852,9 +3923,11 @@ impl Chart {
             self.measured_axis_width += 26.0;
         }
         self.measured_axis_width = self.measured_axis_width.max(independent_axis_width);
-        for tag in tags.iter().skip(usize::from(has_currency)).flatten() {
-            self.measured_axis_width = self.measured_axis_width.max(tag.width() + 5.0 + 6.0);
-        }
+        self.measured_axis_width = self
+            .measured_axis_width
+            .max(rendering::axes::axis_tags_width(
+                tags.iter().skip(usize::from(has_currency)),
+            ));
 
         if show_price_axis && has_currency {
             let currency = self
@@ -3964,6 +4037,14 @@ impl Chart {
         if let Some(id) = overlay_remove {
             self.user_action(|chart| chart.remove_series(id));
         }
+        // The pane layout reads it to maximize or restore the price pane.
+        self.price_plot_double_click = response.double_clicked()
+            && !drawing_gesture
+            && !eraser_mode
+            && self.host_events.target.is_none()
+            && response
+                .interact_pointer_pos()
+                .is_some_and(|pos| chart_rect.contains(pos) && pos.y > legend_bottom);
         self.main_pane_actions(ui, rect, chart_rect);
         self.record_host_click(ui, &response);
         shown

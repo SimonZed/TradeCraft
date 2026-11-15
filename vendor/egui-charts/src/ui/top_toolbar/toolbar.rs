@@ -240,6 +240,8 @@ pub struct TopToolbar {
     pub host_menu_image: Option<egui::ImageSource<'static>>,
     /// Optional status displayed after the left-hand toolbar controls.
     pub host_status: Option<String>,
+    /// Optional host action displayed alongside the left-hand controls.
+    pub host_inline_action: Option<(String, String, egui::Color32, f32)>,
     /// Host call to action as (id, label), drawn as a filled pill at the right end after the host
     /// action slot. Choosing it emits [`TopToolbarAction::Host`] with the id; `None` shows nothing.
     pub call_to_action: Option<(String, String)>,
@@ -262,6 +264,7 @@ impl Default for TopToolbar {
             host_menu_entries: Vec::new(),
             host_menu_image: None,
             host_status: None,
+            host_inline_action: None,
             call_to_action: None,
         }
     }
@@ -554,6 +557,12 @@ impl TopToolbar {
 
         ui.add_space(ui.active_theme().spacing.lg);
         self.show_groups(ui, LEFT, symbol, &mut action);
+        if let Some((id, label, color, size)) = &self.host_inline_action {
+            ui.add_space(gap(ui));
+            if ui.add(egui::Button::new(egui::RichText::new(label).size(*size).color(*color).strong()).frame(false)).clicked() {
+                action = TopToolbarAction::Host(id.clone());
+            }
+        }
         if let Some(status) = &self.host_status {
             ui.add_space(gap(ui));
             ui.label(status);

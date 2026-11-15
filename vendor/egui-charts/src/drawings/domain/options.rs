@@ -20,6 +20,7 @@ use std::ops::RangeInclusive;
 /// `Start` and `End`; rectangles use four corner and four edge handles;
 /// multi-point tools use indexed `Point(i)` handles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum HandlePos {
     /// First anchor point of the drawing.
     Start,
@@ -50,6 +51,7 @@ pub enum HandlePos {
 
 /// Arrow/arrowhead style for line drawings
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ArrowStyle {
     /// No arrowhead
     None,
@@ -108,6 +110,7 @@ pub use crate::config::FontWeight;
 /// value are those of its label, as [`Timeframe::as_str`](crate::model::Timeframe::as_str) writes
 /// it: `90min` is 90 minutes, and a 24 hour interval, labelled `1D`, is 1 day.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TimeframeVisibility {
     /// Show on every interval.
     pub show_on_all: bool,
@@ -283,6 +286,7 @@ impl TimeframeVisibility {
 
 /// Drawing interaction options
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DrawingOptions {
     /// Enable snap to OHLC prices
     pub snap_to_price: bool,
@@ -322,6 +326,7 @@ impl Default for DrawingOptions {
 
 /// Configuration for a single Fibonacci level
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FibonacciLevel {
     /// The ratio value (e.g., 0.236, 0.382, 0.618)
     pub value: f32,
@@ -907,6 +912,7 @@ impl Default for RegressionTrendConfig {
 /// without rounding.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct PositionSizing {
     /// Account-currency value of one price point per underlying unit.
     pub point_value: f64,
@@ -991,6 +997,8 @@ impl PositionReadout {
 
     /// Resolve account economics from a host-supplied rate. Matching currencies need no rate;
     /// a missing rate for a different currency returns `None`, rather than a mislabeled result.
+    /// A code that mixes cases, such as `GBp` for pence, matches only itself; other codes match
+    /// regardless of case.
     pub fn account_sizing(
         &self,
         mut sizing: PositionSizing,
@@ -1000,7 +1008,7 @@ impl PositionReadout {
             return None;
         }
         if let Some(currency) = &self.account_currency
-            && !instrument_currency.is_some_and(|base| base.eq_ignore_ascii_case(currency))
+            && !instrument_currency.is_some_and(|base| crate::model::same_currency(base, currency))
         {
             sizing.point_value *= self.conversion_rate?;
         }
@@ -1289,6 +1297,7 @@ impl LineMeasurements {
 
 /// How a long or short position drawing sizes its quantity.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum PositionSize {
     /// A fixed quantity, interpreted as lots by [`Self::quantity_with_sizing`].
     Quantity(f64),
@@ -1880,6 +1889,63 @@ mod tests {
                     "log {logarithmic}, reverse {reverse}, ratio {ratio}: {got} != {want}"
                 );
             }
+        }
+    }
+
+    /// A code that mixes cases names a minor unit (`GBp` pence, `ZAr` South African cents) and
+    /// matches only itself; codes in a single case match regardless of case. The instrument's
+    /// point is worth one unit of its currency, times the rate when the codes differ.
+    #[test]
+    fn minor_unit_instrument_converts_into_the_account_currency() {
+        let sizing = PositionSizing::default();
+        for (instrument, account, rate, point_value) in [
+            // One pence is 1 x 0.01 = 0.01 pounds.
+            ("GBp", "GBP", Some(0.01), Some(0.01)),
+            ("GBp", "gbp", Some(0.01), Some(0.01)),
+            ("ZAr", "ZAR", Some(0.01), Some(0.01)),
+            // One pound is 1 x 100 = 100 pence.
+            ("GBP", "GBp", Some(100.0), Some(100.0)),
+            // Pence without a rate have no pound value, rather than a mislabeled one.
+            ("GBp", "GBP", None, None),
+            // The same currency takes no rate: the point stays 1.
+            ("GBp", "GBp", Some(0.01), Some(1.0)),
+            ("gbp", "GBP", Some(0.01), Some(1.0)),
+            ("GBP", "GBP", None, Some(1.0)),
+            // Different letters are different currencies in any case.
+            ("GBX", "GBP", Some(0.01), Some(0.01)),
+        ] {
+            let readout = PositionReadout {
+                account_currency: Some(account.into()),
+                conversion_rate: rate,
+                ..Default::default()
+            };
+            assert_eq!(
+                readout
+                    .account_sizing(sizing, Some(instrument))
+                    .map(|sizing| sizing.point_value),
+                point_value,
+                "{instrument} in {account}"
+            );
+        }
+        // Risking 10 pounds with the stop 10 pence away: 10 / (10 x 0.01) = 100 units. Quoted in
+        // pounds, the stop is 10 pounds away: 10 / (10 x 1) = 1 unit.
+        let readout = PositionReadout {
+            account_currency: Some("GBP".into()),
+            conversion_rate: Some(0.01),
+            ..Default::default()
+        };
+        for (instrument, expected) in [("GBp", 100.0), ("gbp", 1.0)] {
+            let quantity = readout.quantity(
+                PositionSize::RiskAmount(10.0),
+                250.0,
+                240.0,
+                sizing,
+                Some(instrument),
+            );
+            assert!(
+                quantity.is_some_and(|quantity| (quantity - expected).abs() < 1e-9),
+                "{instrument}: {quantity:?}"
+            );
         }
     }
 }

@@ -280,53 +280,109 @@ pub(super) fn range_bars(
     )
 }
 
-/// Range bars built from executions, kept until the executions, the range size or the replay
-/// cutoff change.
+/// Range bars built from executions, after the range bars the chart's bars approximate before
+/// the first held trade. The executions are built again when they, the range size or the replay
+/// cutoff change, and joined again when the approximated part changes.
 #[derive(Default)]
 pub(crate) struct ExecutionRanges {
     key: Option<(f64, u64, Option<chrono::DateTime<chrono::Utc>>)>,
+    /// The range bars of the held trades, and the time of the first one.
+    executions: Option<(Vec<Bar>, chrono::DateTime<chrono::Utc>)>,
+    /// The approximated range bars before the bar holding the first held trade, as the cache built
+    /// them: a new build gives a new `Arc`. Held instead of the build, whose `Rc` is not `Send`.
+    approximated: Option<Arc<[Bar]>>,
     built: Option<(Arc<[Bar]>, bool)>,
+    /// Whether `built` starts with approximated range bars.
+    mixed: bool,
 }
 
 impl ExecutionRanges {
-    /// One bar per range bar of the trades before `cutoff` (all of them without one), and whether
-    /// older range bars were left out by the bar limit; `trades_revision` identifies `trades`.
-    /// `None` for an invalid range size or without a trade, when the range bars come from the
-    /// chart's OHLC bars.
+    /// One bar per range bar, and whether older range bars were left out by the bar limit. The
+    /// range bars come from the trades before `cutoff` (all of them without one), after the
+    /// closed range bars approximated from the bars of `history` that open before the bar of
+    /// `clock` holding the first such trade; `trades_revision` identifies `trades` and
+    /// `history_revision` `history`. `None` for an invalid range size, one that waits for
+    /// history or without a trade, when the range bars come from the chart's OHLC bars alone.
     pub(crate) fn bars<'a>(
         &mut self,
         params: &ChartTypeParams,
+        history: &[Bar],
+        history_revision: u64,
+        clock: &crate::model::BarClock,
         trades_revision: u64,
         trades: impl Iterator<Item = &'a crate::model::Tick>,
         cutoff: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Option<(Arc<[Bar]>, bool)> {
-        if params.invalid(ChartType::Range).is_some() {
+        if params.invalid(ChartType::Range).is_some()
+            || params.bars_needed(ChartType::Range).is_some()
+        {
             *self = Self::default();
             return None;
         }
         let key = (params.range_size, trades_revision, cutoff);
         if self.key != Some(key) {
             let mut builder = RangeBarBuilder::new(params.range_size);
+            let mut first = None;
             for trade in trades.filter(|t| cutoff.is_none_or(|c| t.ts < c)) {
+                first.get_or_insert(trade.ts);
                 builder.push_tick(trade);
             }
-            let bars: Arc<[Bar]> = builder
-                .elements()
-                .iter()
+            let bars: Vec<_> = (builder.elements().iter())
                 .map(range_bar::RangeBar::to_bar)
                 .collect();
-            self.built = (!bars.is_empty()).then(|| {
-                let trimmed = bars.len() >= range_bar::MAX_BARS;
-                (bars, trimmed)
-            });
+            self.executions = first.map(|first| (bars, first));
             self.key = Some(key);
+            self.built = None;
+        }
+        let Some((executions, first)) = &self.executions else {
+            (self.built, self.approximated, self.mixed) = (None, None, false);
+            return None;
+        };
+        // The bar holding the first trade is left out: the trades from it on replace its OHLC. A
+        // trade-based bar opens at its first trade, so the last one open by then holds it.
+        let before = if clock.timeframe().is_some_and(|tf| tf.is_trade_based()) {
+            history
+                .partition_point(|bar| bar.time <= *first)
+                .saturating_sub(1)
+        } else {
+            let open = clock.bar_open(*first);
+            history.partition_point(|bar| clock.bar_open(bar.time) < open)
+        };
+        let approximated =
+            (before > 0).then(|| range_bars(&history[..before], history_revision, params));
+        let unchanged = match (&approximated, &self.approximated) {
+            (Some(new), Some(old)) => Arc::ptr_eq(&new.bars, old),
+            (new, old) => new.is_none() && old.is_none(),
+        };
+        if self.built.is_none() || !unchanged {
+            // The range in progress at the first trade is dropped: the trades open the next one.
+            let (closed, late_start) = approximated.as_deref().map_or((&[][..], false), |built| {
+                let open = usize::from(built.builder.has_open_bar());
+                (&built.bars[..built.bars.len() - open], built.late_start)
+            });
+            let all = closed.len() + executions.len();
+            let skipped = all.saturating_sub(range_bar::MAX_BARS);
+            let bars: Arc<[Bar]> = closed
+                .iter()
+                .chain(executions)
+                .skip(skipped)
+                .cloned()
+                .collect();
+            self.built = Some((bars, late_start || all >= range_bar::MAX_BARS));
+            self.mixed = closed.len() > skipped;
+            self.approximated = approximated.map(|built| built.bars.clone());
         }
         self.built.clone()
     }
 
-    /// Whether the last bars came from executions.
-    pub(crate) fn in_use(&self) -> bool {
-        self.built.is_some()
+    /// What the last bars were built from.
+    pub(crate) fn source(&self) -> crate::model::RangeBarSource {
+        use crate::model::RangeBarSource::{Executions, OhlcApproximation, OhlcThenExecutions};
+        match (&self.built, self.mixed) {
+            (None, _) => OhlcApproximation,
+            (Some(_), false) => Executions,
+            (Some(_), true) => OhlcThenExecutions,
+        }
     }
 }
 
@@ -388,14 +444,15 @@ pub(crate) fn markers<'a>(
 }
 
 /// One bar per kept element, and whether older elements were left out by the element or work limit.
-/// Time-based types, invalid parameters and empty builds keep the source bars' axes.
+/// Time-based types, invalid parameters, sizes waiting for history and empty builds keep the
+/// source bars' axes.
 pub(crate) fn elements(
     chart_type: ChartType,
     params: &ChartTypeParams,
     bars: &[Bar],
     revision: u64,
 ) -> Option<(Arc<[Bar]>, bool)> {
-    if params.invalid(chart_type).is_some() {
+    if params.invalid(chart_type).is_some() || params.bars_needed(chart_type).is_some() {
         return None;
     }
     let built = match chart_type {
@@ -679,6 +736,62 @@ mod tests {
         }
     }
 
+    /// A range bar is drawn over its whole range, wherever in it the bar opened.
+    #[test]
+    fn range_bars_are_painted_over_their_whole_range() {
+        use crate::model::BarData;
+        use crate::widget::{
+            Chart,
+            test_frames::{frame, shapes},
+        };
+        // With a range of 2, the fall from 100 to 99 and the rise to 101 complete a bar that
+        // opened at 100, in the middle of its range from 99 to 101.
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let source = [
+            (100.0, 100.0, 100.0, 100.0),
+            (100.0, 100.0, 99.0, 99.0),
+            (99.0, 101.0, 99.0, 101.0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (open, high, low, close))| {
+            let time = start + Duration::minutes(i as i64);
+            Bar::new(time, open, high, low, close, 1.0)
+        })
+        .collect();
+        let mut chart = Chart::new(BarData::from_bars(source));
+        chart.set_chart_type_params(ChartTypeParams {
+            range_size: 2.0,
+            ..Default::default()
+        });
+        chart.set_chart_type(ChartType::Range);
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut chart, 0.0, vec![]);
+        frame(&ctx, &mut chart, 0.1, vec![]);
+        let painted = shapes(&ctx, &mut chart, 0.2, vec![]);
+        let map = chart.get_chart_mapping();
+        let colors = [chart.config().bullish_color, chart.config().bearish_color];
+        let first = painted
+            .iter()
+            .find_map(|shape| match shape {
+                egui::Shape::Rect(rect)
+                    if colors.contains(&rect.fill)
+                        && (rect.rect.center().x - map.idx_to_x(0)).abs() < 0.5 =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("the first range bar");
+        let (top, bottom) = (map.price_to_y(101.0), map.price_to_y(99.0));
+        assert!(
+            (first.top() - top).abs() < 0.01 && (first.bottom() - bottom).abs() < 0.01,
+            "painted {} to {}, want {top} to {bottom}",
+            first.top(),
+            first.bottom()
+        );
+    }
+
     #[test]
     fn box_sizes_freeze_through_streaming_and_wait_for_history() {
         use crate::model::{BarData, BoxSizeMethod};
@@ -917,6 +1030,38 @@ mod tests {
         }
     }
 
+    /// A bar of a trade-based interval opens at its first trade, so the held trades can start
+    /// inside a bar that opens before them, as after the oldest held trades are dropped. That bar
+    /// is left out of the approximation: its rise to 104 after the first held trade is drawn once,
+    /// from the trades.
+    #[test]
+    fn range_bars_leave_the_trade_based_bar_of_the_first_trade_to_the_trades() {
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let at = |second| start + Duration::seconds(second);
+        // Bars of three trades: 99, 99, 100; 100, 100, 101; 101, 101, 104; then 104, 105.
+        let history = [
+            (0, 99.0, 100.0, 99.0, 100.0),
+            (3, 100.0, 101.0, 100.0, 101.0),
+            (6, 101.0, 104.0, 101.0, 104.0),
+            (9, 104.0, 105.0, 104.0, 105.0),
+        ]
+        .map(|(second, open, high, low, close)| Bar::new(at(second), open, high, low, close, 3.0));
+        // The trades from the second one of the third bar on.
+        let trades = [(7, 101.0), (8, 104.0), (9, 104.0), (10, 105.0)]
+            .map(|(second, price)| crate::model::Tick::new(at(second), price, 1.0, None));
+        let params = ChartTypeParams {
+            range_size: 1.0,
+            ..Default::default()
+        };
+        let clock = crate::model::BarClock::new("3t".parse().unwrap());
+        let (bars, _) = ExecutionRanges::default()
+            .bars(&params, &history, 0, &clock, 0, trades.iter(), None)
+            .unwrap();
+        // The first two bars close range bars at 100 and 101, and the trades at 102 to 105.
+        let closes: Vec<_> = bars.iter().map(|bar| bar.close).collect();
+        assert_eq!(closes, [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]);
+    }
+
     #[test]
     fn price_based_charts_are_built_over_the_whole_history() {
         // (name, chart type, params, calls as (bars, revision), expected OHLC ends and minutes)
@@ -1039,6 +1184,111 @@ mod tests {
                 (got != *want).then(|| format!("{name}: {got:?}, want {want:?}"))
             })
             .collect();
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// The newest close adds no element and lies beyond the elements in view, further than the
+    /// scale margins of a tenth of the pane reach: the fit holds the last price line and its
+    /// label all the same.
+    #[test]
+    fn last_price_line_stays_in_view_on_price_based_charts() {
+        use crate::model::{BarData, LineStyle};
+        use crate::widget::test_frames::{frame, shapes};
+        use crate::widget::{Chart, SeriesId};
+        use egui::{Color32, Shape};
+        // (chart type, parameters, first open, closes, label of the newest close)
+        type Row<'a> = (ChartType, ChartTypeParams, Option<f64>, &'a [f64], &'a str);
+        // Lines of 10 from 100 to 340, then 241: above 240, the low of the last ten lines. Any
+        // close that adds no line lies within those, so this chart is read with fewer in view.
+        let stairs = Vec::from_iter((1..=24).map(|i| 100.0 + 10.0 * f64::from(i)).chain([241.0]));
+        let rows: [Row; 4] = [
+            // Bricks of 1 from 100 to 103, fitted up to 103.375.
+            (
+                ChartType::Renko,
+                ChartTypeParams::default(),
+                None,
+                &[100.0, 101.2, 102.4, 103.1, 103.4],
+                "103.40",
+            ),
+            // One line from 100 to 102, fitted down to 99.75; 97.5 is short of a reversal of 5.
+            (
+                ChartType::Kagi,
+                ChartTypeParams {
+                    kagi_reversal: 5.0,
+                    ..Default::default()
+                },
+                None,
+                &[100.0, 102.0, 97.5],
+                "97.50",
+            ),
+            (
+                ChartType::LineBreak,
+                ChartTypeParams {
+                    line_break_count: 10,
+                    ..Default::default()
+                },
+                Some(100.0),
+                &stairs,
+                "241.00",
+            ),
+            // One column of boxes of 1 from 100 to 102, fitted up to 102.25.
+            (
+                ChartType::PointAndFigure,
+                ChartTypeParams::default(),
+                None,
+                &[100.0, 102.0, 102.9],
+                "102.90",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (kind, params, first_open, closes, label) in rows {
+            let ctx = egui::Context::default();
+            let mut chart = Chart::new(BarData::from_bars(bars(0, closes, first_open)));
+            chart.set_chart_type_params(params);
+            chart.set_chart_type(kind);
+            let style = chart.series_style_mut(SeriesId::MAIN).unwrap();
+            style.price_line_color = Some(Color32::GOLD);
+            style.price_line_style = LineStyle::Solid;
+            frame(&ctx, &mut chart, 0.0, vec![]);
+            // About five slots across the plot, the newest element one slot from its right edge.
+            chart.apply_synced_time_scale(150.0, 1.0);
+            frame(&ctx, &mut chart, 0.1, vec![]);
+            let painted = shapes(&ctx, &mut chart, 0.2, vec![]);
+            let plot = chart.get_rendered_price_rect();
+            let y = chart
+                .get_chart_mapping()
+                .price_to_y(closes[closes.len() - 1]);
+            if !painted.iter().any(|shape| {
+                matches!(shape,
+                    Shape::LineSegment { points, stroke }
+                        if stroke.color == Color32::GOLD
+                            && (points[0].y - y).abs() < 0.1
+                            && plot.y_range().contains(y)
+                )
+            }) {
+                let view = chart.state.visible_range();
+                failures.push(format!(
+                    "{kind:?}: no last price line at y {y}, {view:?} in view"
+                ));
+            }
+            let tag = painted.iter().find_map(|shape| match shape {
+                Shape::Rect(rect)
+                    if rect.fill == Color32::GOLD && rect.rect.center().x > plot.right() =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            });
+            if !tag.is_some_and(|tag| {
+                painted.iter().any(|shape| {
+                    matches!(shape,
+                        Shape::Text(text) if text.galley.text() == label && tag.contains(text.pos)
+                    )
+                })
+            }) {
+                failures.push(format!("{kind:?}: no last price label {label}"));
+            }
+        }
         assert!(failures.is_empty(), "{failures:#?}");
     }
 }

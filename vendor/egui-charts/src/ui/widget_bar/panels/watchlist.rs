@@ -131,6 +131,8 @@ pub enum WatchlistAction {
     None,
     /// Show this symbol on the chart. The panel already marks it selected.
     SelectSymbol(String),
+    /// Open the host's options view for this symbol.
+    Options(String),
     /// Let the user pick a symbol, such as with symbol search, and pass it to
     /// [`WatchlistPanel::add_symbol`].
     AddSymbol,
@@ -172,6 +174,7 @@ struct RowDrag(egui::Id, usize);
 /// expands its symbols. Unsorted rows are dragged to reorder, and rows are right-clicked to
 /// flag, rename or remove. The host persists [`lists`](Self::lists) and handles file intents.
 pub struct WatchlistPanel {
+    options_action: bool,
     lists: Vec<Watchlist>,
     active: usize,
     quotes: HashMap<String, Quote>,
@@ -227,6 +230,7 @@ impl WatchlistPanel {
             lists.push(Watchlist::new("Watchlist"));
         }
         Self {
+            options_action: false,
             lists,
             active: 0,
             quotes: HashMap::new(),
@@ -247,6 +251,9 @@ impl WatchlistPanel {
             subscribed: Vec::new(),
         }
     }
+
+    /// Enable the host-provided options action on symbol context menus.
+    pub fn set_options_action(&mut self, enabled: bool) { self.options_action = enabled; }
 
     /// Shows these columns after the symbol, in order; the default is
     /// [`WatchlistColumn::DEFAULT`]. A quote without a column's figure shows a dash, apart from a
@@ -456,6 +463,7 @@ impl WatchlistPanel {
             section,
             flag_filter,
             selected,
+            options_action,
             ..
         } = self;
         let theme = ui.active_theme();
@@ -1036,6 +1044,10 @@ impl WatchlistPanel {
                                 });
                             }
                             response.context_menu(|ui| {
+                                if *options_action && ui.button("View options").clicked() {
+                                    action = WatchlistAction::Options(symbol.clone());
+                                    ui.close();
+                                }
                                 ui.horizontal(|ui| {
                                     for choice in WatchlistFlag::ALL {
                                         let (swatch, response) = ui

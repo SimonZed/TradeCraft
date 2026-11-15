@@ -40,9 +40,9 @@ pub struct PineStudy {
     markers: Vec<IndicatorMarker>,
     drawings: Vec<Drawing>,
     tables: Vec<StudyTable>,
-    /// Histories the last run read for `request.security` on other symbols.
+    /// Histories the last run read for `request.security` on other series.
     sources: Vec<SecurityData>,
-    /// Other-symbol histories the script asks the chart for, as `(symbol, interval)`.
+    /// Histories the script asked the chart for besides its own series, as `(symbol, interval)`.
     requests: Vec<(String, Timeframe)>,
     inputs: Vec<StudyInput>,
     visible: bool,
@@ -438,6 +438,9 @@ fn study_drawing(output: &DrawingOutput) -> Drawing {
     drawing.font_size = output.font_size;
     drawing.fill_color = output.fill_color.map(|color| color.to_srgba_unmultiplied());
     drawing.text_color = output.text_color.map(|color| color.to_srgba_unmultiplied());
+    if let Some(style) = &output.label_style {
+        drawing.custom_settings = serde_json::json!({"pine_label_style": style});
+    }
     if !output.text.is_empty() {
         drawing.text = Some(output.text.clone());
     }
@@ -543,6 +546,31 @@ mod tests {
     use chrono::DateTime;
 
     #[test]
+    fn pine_label_styles_reach_the_chart_drawing() {
+        let mut study = PineStudy::new("indicator(\"Labels\")\nlabel.new(bar_index, close, \"A\", style=label.style_label_down)\nlabel.new(bar_index, close, \"B\", style=label.style_label_up)\n").unwrap();
+        study.calculate(&bars(&[10.0]));
+        let drawings = study.drawings();
+        assert_eq!(drawings.len(), 2);
+        assert_eq!(drawings[0].custom_settings["pine_label_style"], "style_label_down");
+        assert_eq!(drawings[1].custom_settings["pine_label_style"], "style_label_up");
+    }
+
+    #[test]
+    fn finer_history_is_requested_and_used_after_arrival() {
+        let mut study = PineStudy::new("indicator(\"Finer\")\nplot(request.security(syminfo.tickerid, \"1\", close))\n").unwrap();
+        study.set_instrument(Some(&Instrument::new("TEST")));
+        study.set_timeframe(Timeframe::Min5);
+        let chart = vec![Bar::new(DateTime::UNIX_EPOCH, 1.0, 2.0, 0.0, 1.0, 1.0)];
+        study.calculate(&chart);
+        let request = study.data_requests().pop().expect("finer history requested");
+        assert_eq!(request.timeframe, Some(Timeframe::Min1));
+        let finer: Vec<_> = (0..5).map(|i| Bar::new(DateTime::UNIX_EPOCH + chrono::Duration::minutes(i), 1.0, 10.0, 0.0, (i + 1) as f64, 1.0)).collect();
+        let source = StudyData { request, bars: &finer, clock: egui_charts::model::BarClock::new(Timeframe::Min1), instrument: None, timeframe: Timeframe::Min1 };
+        study.update_data(&chart, 0, &[source]);
+        assert_eq!(study.values().value(0, 0), Some(5.0));
+    }
+
+    #[test]
     fn session_levels_ignore_after_hours_and_show_prior_close() {
         use chrono::TimeZone;
         let script = crate::pine_engine::Script::parse(include_str!("../../../../scripts/pine/bb-levels.pine")).unwrap();
@@ -558,6 +586,11 @@ mod tests {
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
         let latest: Vec<_> = output.plots.iter().map(|plot| *plot.values.last().unwrap()).collect();
         assert_eq!(latest, [150.0, 100.0, 140.0, 90.0, 115.0, 120.0, 110.0]);
+        for bar in 3..bars.len() {
+            assert_eq!(output.plots[2].values[bar], 140.0);
+            assert_eq!(output.plots[3].values[bar], 90.0);
+            assert_eq!(output.plots[4].values[bar], 115.0);
+        }
         assert_eq!(output.security_requests, [("TEST".into(), Timeframe::Day1)]);
         assert!(output.plots[4].track_price && output.plots[4].track_price_solid);
         assert_eq!(output.plots[4].color, Color32::YELLOW);

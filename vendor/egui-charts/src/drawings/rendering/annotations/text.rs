@@ -6,6 +6,21 @@ use crate::styles::typography::font_size;
 use crate::tokens::DESIGN_TOKENS;
 use egui::epaint::StrokeKind;
 
+fn pine_label_origin(style: &str, pos: egui::Pos2, size: egui::Vec2) -> egui::Pos2 {
+    let anchor = match style {
+        "style_label_up" => egui::Align2::CENTER_TOP,
+        "style_label_down" => egui::Align2::CENTER_BOTTOM,
+        "style_label_left" => egui::Align2::LEFT_CENTER,
+        "style_label_right" => egui::Align2::RIGHT_CENTER,
+        "style_label_upper_left" => egui::Align2::LEFT_TOP,
+        "style_label_upper_right" => egui::Align2::RIGHT_TOP,
+        "style_label_lower_left" => egui::Align2::LEFT_BOTTOM,
+        "style_label_lower_right" => egui::Align2::RIGHT_BOTTOM,
+        _ => egui::Align2::CENTER_CENTER,
+    };
+    anchor.align_size_within_rect(size, egui::Rect::from_min_max(pos, pos)).min
+}
+
 impl Drawing {
     /// Renders Text and Anchored text with the text's top-left corner on the first anchor,
     /// surrounded by a background and border when enabled. Anchored text differs only in
@@ -33,6 +48,10 @@ impl Drawing {
             }
             galley = painter.layout_job(job);
         }
+        let pos = match self.custom_settings.get("pine_label_style").and_then(|value| value.as_str()) {
+            Some(style) => pine_label_origin(style, pos, galley.size()),
+            None => pos,
+        };
         if colors.fill.a() > 0 || !colors.border.is_empty() {
             let padding = egui::vec2(
                 DESIGN_TOKENS.sizing.annotation.label_padding_x,
@@ -48,5 +67,20 @@ impl Drawing {
             );
         }
         painter.galley(pos, galley, colors.text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pine_labels_are_placed_on_the_requested_side() {
+        let point = egui::pos2(100.0, 100.0);
+        let size = egui::vec2(40.0, 20.0);
+        assert_eq!(pine_label_origin("style_label_down", point, size), egui::pos2(80.0, 80.0));
+        assert_eq!(pine_label_origin("style_label_up", point, size), egui::pos2(80.0, 100.0));
+        assert_eq!(pine_label_origin("style_label_left", point, size), egui::pos2(100.0, 90.0));
+        assert_eq!(pine_label_origin("style_label_right", point, size), egui::pos2(60.0, 90.0));
     }
 }

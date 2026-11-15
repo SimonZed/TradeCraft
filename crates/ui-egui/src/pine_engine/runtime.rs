@@ -11,6 +11,7 @@ use egui_charts::studies::{
     FillBoundary, PlotType, StudyCell, StudyFill, StudyTable, StudyTablePosition,
 };
 
+use crate::pine_engine::ast;
 use crate::pine_engine::ast::{
     Arg, Diagnostic, Expr, Function, NodeId, Program, Stmt, TypeDecl,
 };
@@ -66,7 +67,7 @@ impl Default for Context {
     }
 }
 
-/// A history the host fetched for a `request.security` on another symbol.
+/// A history the host fetched for a `request.security` on another symbol or a lower timeframe.
 #[derive(Clone, Debug)]
 pub struct SecurityData {
     pub symbol: String,
@@ -129,7 +130,8 @@ pub struct RunOutput {
     pub fills: Vec<StudyFill>,
     pub drawings: Vec<DrawingOutput>,
     pub tables: Vec<StudyTable>,
-    /// Other-symbol histories the script read, as `(symbol, interval)`.
+    /// Histories the script read besides the chart's own series: another symbol or a lower
+    /// timeframe, as `(symbol, interval)`.
     pub security_requests: Vec<(String, egui_charts::model::Timeframe)>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -159,6 +161,7 @@ pub struct DrawingOutput {
     pub fill_color: Option<Color32>,
     pub width: f32,
     pub style: egui_charts::model::LineStyle,
+    pub label_style: Option<String>,
     pub font_size: f32,
 }
 
@@ -167,6 +170,9 @@ pub struct DrawingOutput {
 struct Var {
     value: Value,
     history: Vec<Value>,
+    /// Whether a `var` already ran its initializer, including one in a function that a script
+    /// first reached on a later bar.
+    initialized: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +209,25 @@ struct SecuritySlot {
     /// series comes from another symbol, so a reload starts it over.
     key: Option<i64>,
     ta: HashMap<NodeId, TaState>,
+    function_vars: HashMap<(Vec<NodeId>, String), Value>,
+    /// The script variables the request's expression can read, found on its first evaluation.
+    /// Only they are copied from the chart's own state, since a request over bars reads none.
+    referenced: Option<SecurityVars>,
+}
+
+/// The chart variables a `request.security` expression can read.
+#[derive(Debug)]
+enum SecurityVars {
+    /// All of them: the expression names its source at run time, as `input.source` does.
+    All,
+    /// Only these, found by reading the expression and the functions it calls.
+    Named(HashSet<String>),
+}
+
+struct LowerSeries {
+    opens: Vec<i64>,
+    closes: Vec<i64>,
+    values: Vec<Value>,
 }
 
 /// Runs one script over a bar series.
@@ -213,6 +238,9 @@ pub struct Evaluator<'a> {
     inputs: &'a HashMap<NodeId, Value>,
     vars: HashMap<String, Var>,
     locals: Vec<HashMap<String, Value>>,
+    function_path: Vec<NodeId>,
+    function_frames: Vec<(usize, HashSet<String>)>,
+    function_vars: HashMap<(Vec<NodeId>, String), Value>,
     functions: HashMap<&'a str, &'a Function>,
     types: HashMap<&'a str, &'a TypeDecl>,
     ta: HashMap<NodeId, TaState>,
@@ -224,6 +252,14 @@ pub struct Evaluator<'a> {
     shapes: Vec<ShapeSlot>,
     shape_at: HashMap<NodeId, usize>,
     security: HashMap<NodeId, SecuritySlot>,
+    /// The value a call site answered on each bar, kept only for call sites a script indexes
+    /// with `[n]`, so `time(tf)[1]` and `ta.sma(...)[1]` read what the earlier bars saw.
+    call_history: HashMap<NodeId, Vec<Value>>,
+    /// The call sites whose value `call_history` keeps.
+    indexed: &'a HashSet<NodeId>,
+    lower: HashMap<(NodeId, String, egui_charts::model::Timeframe), LowerSeries>,
+    sampling: Option<(NodeId, Vec<(usize, Value)>)>,
+    nested_lower: bool,
     /// Histories for `request.security` calls on other symbols, supplied by the host.
     sources: &'a [SecurityData],
     /// Every other-symbol `request.security` this run asked for, with its interval.
@@ -269,6 +305,9 @@ impl<'a> Evaluator<'a> {
             inputs,
             vars: HashMap::new(),
             locals: Vec::new(),
+            function_path: Vec::new(),
+            function_frames: Vec::new(),
+            function_vars: HashMap::new(),
             functions,
             types,
             ta: HashMap::new(),
@@ -280,6 +319,11 @@ impl<'a> Evaluator<'a> {
             shapes: Vec::new(),
             shape_at: HashMap::new(),
             security: HashMap::new(),
+            call_history: HashMap::new(),
+            indexed: &program.indexed,
+            lower: HashMap::new(),
+            sampling: None,
+            nested_lower: false,
             sources,
             security_requests: Vec::new(),
             diagnostics: Vec::new(),
@@ -424,6 +468,7 @@ impl<'a> Evaluator<'a> {
                     .map(|cell| match cell {
                         StudyCell::Text(text) => text,
                         StudyCell::Percent(_) => String::new(),
+                        _ => String::new(),
                     })
                     .collect()
             } else {
@@ -466,14 +511,12 @@ impl<'a> Evaluator<'a> {
                     }
                 }
             }
-            let table = StudyTable {
-                title: String::new(),
-                columns: headings,
-                rows: cells,
-                cell_bg,
-                cell_text,
-                position: table_position(fields.get("__position").and_then(Value::text)),
-            };
+            let mut table = StudyTable::default();
+            table.columns = headings;
+            table.rows = cells;
+            table.cell_bg = cell_bg;
+            table.cell_text = cell_text;
+            table.position = table_position(fields.get("__position").and_then(Value::text));
             built.push((filled, table));
         }
         built.sort_by_key(|(filled, _)| std::cmp::Reverse(*filled));
@@ -517,8 +560,10 @@ impl<'a> Evaluator<'a> {
             let var = self.vars.entry(name.to_owned()).or_insert_with(|| Var {
                 value: Value::Na,
                 history: Vec::new(),
+                initialized: true,
             });
             var.value = value;
+            var.initialized = true;
         } else if let Some(scope) = self.locals.last_mut() {
             scope.insert(name.to_owned(), value);
         }
@@ -538,8 +583,32 @@ impl<'a> Evaluator<'a> {
                 reassign,
             } => {
                 // `var x = …` runs on the first bar only; a missing one is `na` until assigned.
-                if *sticky && self.bar > 0 {
-                    return self.ident(name);
+                if *sticky && let Some((scope_index, _)) = self.function_frames.last() {
+                    let scope_index = *scope_index;
+                    let key = (self.function_path.clone(), name.clone());
+                    let value = match self.function_vars.get(&key) {
+                        Some(value) => value.clone(),
+                        None => { let value = self.eval(value); self.function_vars.insert(key, value.clone()); value }
+                    };
+                    self.locals[scope_index].insert(name.clone(), value.clone());
+                    self.function_frames.last_mut().unwrap().1.insert(name.clone());
+                    return value;
+                }
+                if *sticky && self.locals.is_empty() {
+                    if let Some(var) = self.vars.get(name)
+                        && var.initialized
+                    {
+                        return var.value.clone();
+                    }
+                    let value = self.eval(value);
+                    let var = self.vars.entry(name.to_owned()).or_insert_with(|| Var {
+                        value: Value::Na,
+                        history: Vec::new(),
+                        initialized: false,
+                    });
+                    var.value = value.clone();
+                    var.initialized = true;
+                    return value;
                 }
                 let value = self.eval(value);
                 self.store(name, value.clone(), *reassign);
@@ -797,7 +866,17 @@ impl<'a> Evaluator<'a> {
                 receiver,
                 args,
                 line,
-            } => self.call(*id, callee, receiver.as_deref(), args, *line),
+            } => {
+                let value = self.call(*id, callee, receiver.as_deref(), args, *line);
+                if self.indexed.contains(id) {
+                    let history = self.call_history.entry(*id).or_default();
+                    if history.len() <= self.bar {
+                        history.resize(self.bar + 1, Value::Na);
+                    }
+                    history[self.bar] = value.clone();
+                }
+                value
+            }
             Expr::Index { target, index } => self.index(target, index),
             Expr::Unary { op, value } => {
                 let value = self.eval(value);
@@ -911,6 +990,16 @@ impl<'a> Evaluator<'a> {
                 .get(self.bar)
                 .map(|bar| Value::Num(bar.time.timestamp_millis() as f64))
                 .unwrap_or(Value::Na),
+            // A bar closes one timeframe after it opens; a trade-based chart has no duration.
+            "time_close" => self
+                .bars
+                .get(self.bar)
+                .map(|bar| {
+                    Value::Num(
+                        (bar.time.timestamp_millis() + self.context.timeframe.duration_ms()) as f64,
+                    )
+                })
+                .unwrap_or(Value::Na),
             "hour" => self.clock(|time| time.hour() as f64),
             "minute" => self.clock(|time| time.minute() as f64),
             "second" => self.clock(|time| time.second() as f64),
@@ -954,6 +1043,27 @@ impl<'a> Evaluator<'a> {
             .unwrap_or(Value::Na)
     }
 
+    /// Session boundaries use the chart's selected timezone. Regular hours are the
+    /// configured fallback of 09:30–16:00 because exchange calendars are unavailable.
+    fn session_boundary(&self, regular: bool, first: bool) -> bool {
+        let Some(bar) = self.bars.get(self.bar) else { return false; };
+        let now = bar.time.with_timezone(&self.context.timezone);
+        let in_regular = |time: &chrono::DateTime<egui_charts::model::TimezoneId>| {
+            let minute = time.hour() * 60 + time.minute();
+            (570..960).contains(&minute)
+        };
+        if regular && !in_regular(&now) { return false; }
+        let other = if first { self.bar.checked_sub(1).and_then(|i| self.bars.get(i)) } else { self.bars.get(self.bar + 1) };
+        if let Some(other) = other {
+            let other = other.time.with_timezone(&self.context.timezone);
+            return other.date_naive() != now.date_naive() || (regular && !in_regular(&other));
+        }
+        if first { return true; }
+        let end = bar.time + chrono::Duration::milliseconds(self.context.timeframe.duration_ms().max(0));
+        let end = end.with_timezone(&self.context.timezone);
+        end.date_naive() != now.date_naive() || (regular && !in_regular(&end))
+    }
+
     fn member(&self, path: &str) -> Value {
         // An `enum` entry or a type's default: `Color.red` is a constant, not an object field.
         if let Some((namespace, name)) = path.split_once('.')
@@ -967,6 +1077,10 @@ impl<'a> Evaluator<'a> {
                 .unwrap_or(Value::Na);
         }
         match path {
+            "session.isfirstbar" => return Value::Bool(self.session_boundary(false, true)),
+            "session.islastbar" => return Value::Bool(self.session_boundary(false, false)),
+            "session.isfirstbar_regular" => return Value::Bool(self.session_boundary(true, true)),
+            "session.islastbar_regular" => return Value::Bool(self.session_boundary(true, false)),
             "math.pi" => return Value::Num(std::f64::consts::PI),
             "math.e" => return Value::Num(std::f64::consts::E),
             "barstate.isfirst" => return Value::Bool(self.bar == 0),
@@ -1478,6 +1592,21 @@ impl<'a> Evaluator<'a> {
             return Value::Na;
         }
         let offset = offset as usize;
+        if let Expr::Call { id, .. } = target {
+            // Evaluating the call keeps a stateful builtin in step with Pine; `[0]` then reads
+            // back the value this bar just recorded.
+            self.eval(target);
+            return self
+                .bar
+                .checked_sub(offset)
+                .and_then(|bar| {
+                    self.call_history
+                        .get(id)
+                        .and_then(|history| history.get(bar))
+                        .cloned()
+                })
+                .unwrap_or(Value::Na);
+        }
         let Expr::Ident(name) = target else {
             return Value::Na;
         };
@@ -1793,12 +1922,26 @@ impl<'a> Evaluator<'a> {
             if matches!(value, Value::Object(_))
                 && let Some(function) = self.functions.get(method.as_str()).copied()
             {
-                return self.call_function(function, args, Some(value), line);
+                return self.call_function(id, function, args, Some(value), line);
             }
         }
         if let Some(rest) = name.strip_prefix("timeframe.") {
             return match rest {
-                "in_seconds" => Value::Num((self.context.timeframe.duration_ms() / 1000) as f64),
+                "in_seconds" => {
+                    let text = args
+                        .first()
+                        .map(|arg| self.eval(&arg.value))
+                        .and_then(|value| value.text().map(str::to_owned))
+                        .filter(|text| !text.is_empty());
+                    match text.as_deref().and_then(Bucket::parse) {
+                        Some(bucket) => Value::Num((bucket.duration_ms() / 1000) as f64),
+                        // Without a period the chart's own interval is what Pine answers.
+                        None if text.is_none() => {
+                            Value::Num((self.context.timeframe.duration_ms() / 1000) as f64)
+                        }
+                        None => Value::Na,
+                    }
+                }
                 // True on the first bar of a new `period`, as `timeframe.change` documents.
                 "change" => {
                     let period = args
@@ -1845,16 +1988,20 @@ impl<'a> Evaluator<'a> {
         if callee.len() == 1
             && let Some(function) = self.functions.get(name.as_str()).copied()
         {
-            return self.call_function(function, args, None, line);
+            return self.call_function(id, function, args, None, line);
         }
         self.unsupported(line, &name)
     }
 
-    /// `request.security(symbol, timeframe, expression)`: the expression's value on the last
-    /// closed bar of `timeframe`, sampled from the bars on the chart. Another symbol reads the
-    /// history the host supplied for it. With `lookahead=barmerge.lookahead_on` the higher bar is
-    /// taken whole as soon as it opens, as Pine does when it repaints historical security values.
     fn security(&mut self, id: NodeId, args: &[Arg]) -> Value {
+        let value = self.security_value(id, args);
+        if let Some((sampled, readings)) = &mut self.sampling && *sampled == id {
+            readings.push((self.bar, value.clone()));
+        }
+        value
+    }
+
+    fn security_value(&mut self, id: NodeId, args: &[Arg]) -> Value {
         let symbol = args
             .first()
             .map(|arg| self.eval(&arg.value))
@@ -1882,16 +2029,14 @@ impl<'a> Evaluator<'a> {
                 None => return Value::Na,
             },
         };
-        if !symbol.is_empty() && symbol != self.context.symbol {
-            return self.security_other(id, &symbol, bucket, expr, lookahead);
-        }
-        if bucket == chart {
+        if bucket == chart && (symbol.is_empty() || symbol == self.context.symbol) {
             return self.eval(expr);
         }
         if bucket.duration_ms() < self.context.timeframe.duration_ms() {
-            // A lower timeframe is `request.security_lower_tf`'s series, which this engine does
-            // not hold.
-            return Value::Na;
+            return self.lower_security(id, &symbol, bucket, lookahead);
+        }
+        if !symbol.is_empty() && symbol != self.context.symbol {
+            return self.security_other(id, &symbol, bucket, expr, lookahead);
         }
         if bucket == Bucket::Day && !lookahead {
             let zone = named(args, "timezone")
@@ -1910,6 +2055,8 @@ impl<'a> Evaluator<'a> {
             bucket,
             key: None,
             ta: HashMap::new(),
+            function_vars: HashMap::new(),
+            referenced: None,
         });
         if lookahead {
             if slot.key != Some(key) {
@@ -1960,6 +2107,64 @@ impl<'a> Evaluator<'a> {
         value
     }
 
+    /// Evaluate a same-symbol finer series once, then select only bars within this chart bar.
+    fn lower_security(&mut self, id: NodeId, symbol: &str, bucket: Bucket, lookahead: bool) -> Value {
+        let Some(timeframe) = bucket.timeframe() else { return Value::Na; };
+        let symbol = if symbol.is_empty() { self.context.symbol.clone() } else { symbol.to_owned() };
+        let request = (symbol.clone(), timeframe);
+        if !self.security_requests.contains(&request) { self.security_requests.push(request); }
+        if self.nested_lower {
+            let message = "Nested lower-timeframe requests are not supported".to_owned();
+            if self.reported.insert((0, message.clone())) { self.diagnostics.push(Diagnostic { line: 0, message }); }
+            return Value::Na;
+        }
+        let Some(source) = self.sources.iter().find(|s| s.symbol == symbol && s.timeframe == timeframe) else { return Value::Na; };
+        if source.bars.len() > 10_000 {
+            let message = "Lower-timeframe history exceeds 10,000 bars".to_owned();
+            if self.reported.insert((0, message.clone())) { self.diagnostics.push(Diagnostic { line: 0, message }); }
+            return Value::Na;
+        }
+        let Some(bar) = self.bars.get(self.bar) else { return Value::Na; };
+        let start = bar.time.timestamp_millis();
+        let Some(end) = start.checked_add(self.context.timeframe.duration_ms()) else { return Value::Na; };
+        let key = (id, symbol.clone(), timeframe);
+        if !self.lower.contains_key(&key) {
+            let mut context = self.context.clone();
+            context.symbol = symbol;
+            context.timeframe = timeframe;
+            let mut sub = Evaluator::new(self.program, &source.bars, &context, self.inputs, self.sources);
+            sub.nested_lower = true;
+            sub.sampling = Some((id, Vec::new()));
+            sub.steps = self.steps;
+            let body = sub.program.body.as_slice();
+            for at in 0..source.bars.len() {
+                sub.bar = at;
+                if sub.charge(0) { break; }
+                sub.run_block(body);
+                sub.finish_bar();
+                if sub.out_of_budget { break; }
+            }
+            self.steps = sub.steps;
+            self.out_of_budget |= sub.out_of_budget;
+            for diagnostic in sub.diagnostics.drain(..) {
+                if self.reported.insert((diagnostic.line, diagnostic.message.clone())) { self.diagnostics.push(diagnostic); }
+            }
+            let opens: Vec<_> = source.bars.iter().map(|b| b.time.timestamp_millis()).collect();
+            let closes: Vec<_> = opens.iter().map(|open| open.saturating_add(timeframe.duration_ms())).collect();
+            let mut values = vec![Value::Na; source.bars.len()];
+            for (at, value) in sub.sampling.take().map(|(_, v)| v).unwrap_or_default() {
+                if let Some(slot) = values.get_mut(at) { *slot = value; }
+            }
+            self.lower.insert(key.clone(), LowerSeries { opens, closes, values });
+        }
+        let series = &self.lower[&key];
+        let first = series.opens.partition_point(|open| *open < start);
+        let last = series.closes.partition_point(|close| *close <= end);
+        if first >= last { return Value::Na; }
+        let at = if lookahead { first } else { last - 1 };
+        series.values.get(at).cloned().unwrap_or(Value::Na)
+    }
+
     /// Read the provider's daily series instead of folding extended intraday bars into it.
     fn security_same_daily(&mut self, id: NodeId, symbol: &str, expr: &Expr, timezone: &egui_charts::model::TimezoneId) -> Value {
         use egui_charts::model::Timeframe;
@@ -1973,8 +2178,24 @@ impl<'a> Evaluator<'a> {
         let Some(current_time) = self.bars.get(self.bar).map(|bar| bar.time) else { return Value::Na; };
         let date = current_time.with_timezone(timezone).date_naive();
         let completed = source.bars.partition_point(|bar| bar.time.with_timezone(timezone).date_naive() < date);
+        // A literal historical OHLCV reference names a completed daily bar. Read it
+        // directly for every intraday bar, including historical premarket bars; today's
+        // provider bar may contain data that was not yet known at that time.
+        if let Expr::Index { target, index } = expr
+            && let (Expr::Ident(field), Expr::Number(offset)) = (target.as_ref(), index.as_ref())
+            && offset.is_finite() && *offset >= 1.0 && offset.fract() == 0.0 && *offset <= usize::MAX as f64
+            && matches!(field.as_str(), "open" | "high" | "low" | "close" | "volume")
+        {
+            return completed.checked_sub(*offset as usize)
+                .and_then(|at| source.bars.get(at))
+                .map(|bar| Value::Num(match field.as_str() {
+                    "open" => bar.open, "high" => bar.high, "low" => bar.low,
+                    "close" => bar.close, _ => bar.volume,
+                }))
+                .unwrap_or(Value::Na);
+        }
         let mut slot = self.security.remove(&id).unwrap_or_else(|| SecuritySlot {
-            bars: Vec::new(), values: Vec::new(), bucket: Bucket::Day, key: None, ta: HashMap::new(),
+            bars: Vec::new(), values: Vec::new(), bucket: Bucket::Day, key: None, ta: HashMap::new(), function_vars: HashMap::new(), referenced: None,
         });
         // Closed daily bars are evaluated only once as chart time advances.
         let new_bars = source.bars[slot.bars.len().min(completed)..completed].to_vec();
@@ -2016,7 +2237,8 @@ impl<'a> Evaluator<'a> {
             self.security_requests.push(request);
         }
         if bucket.duration_ms() < self.context.timeframe.duration_ms() {
-            // A lower timeframe is `request.security_lower_tf`'s series.
+            // Only the chart's own symbol is run again on a finer series; another symbol's lower
+            // timeframe would need a second history this engine does not fetch.
             return Value::Na;
         }
         let Some(bar) = self.bars.get(self.bar) else {
@@ -2048,6 +2270,8 @@ impl<'a> Evaluator<'a> {
             bucket,
             key: Some(first),
             ta: HashMap::new(),
+            function_vars: HashMap::new(),
+            referenced: None,
         });
         // A changed interval or a deeper history re-reads the series from its start.
         if slot.bucket != bucket || slot.key != Some(first) {
@@ -2057,6 +2281,8 @@ impl<'a> Evaluator<'a> {
                 bucket,
                 key: Some(first),
                 ta: HashMap::new(),
+                function_vars: HashMap::new(),
+                referenced: slot.referenced,
             };
         }
         let new_bars: Vec<Bar> = source.bars[slot.bars.len().min(seen)..seen].to_vec();
@@ -2075,25 +2301,38 @@ impl<'a> Evaluator<'a> {
     /// keeping its `ta` state between those bars.
     fn eval_security(&mut self, slot: &mut SecuritySlot, expr: &Expr, bar: usize) -> Value {
         let mut sub = Evaluator::new(self.program, &[], self.context, self.inputs, self.sources);
+        sub.steps = self.steps;
+        sub.nested_lower = self.nested_lower;
         sub.bars = Cow::Owned(std::mem::take(&mut slot.bars));
         sub.ta = std::mem::take(&mut slot.ta);
+        sub.function_vars = std::mem::take(&mut slot.function_vars);
+        // A request inside a lower-timeframe run must not start another such run.
         // A chart series passed to `request.security` keeps the value it had when the
         // higher-timeframe bar closed.
-        sub.vars = self
-            .vars
-            .iter()
-            .map(|(name, var)| {
-                (
-                    name.clone(),
-                    Var {
-                        value: var.value.clone(),
-                        history: Vec::new(),
-                    },
-                )
-            })
-            .collect();
+        if slot.referenced.is_none() {
+            slot.referenced = Some(referenced_vars(self.program, expr));
+        }
+        let copy = |name: &String, var: &Var| {
+            (
+                name.clone(),
+                Var {
+                    value: var.value.clone(),
+                    history: Vec::new(),
+                    initialized: var.initialized,
+                },
+            )
+        };
+        sub.vars = match slot.referenced.as_ref().unwrap() {
+            SecurityVars::All => self.vars.iter().map(|(name, var)| copy(name, var)).collect(),
+            SecurityVars::Named(names) => names
+                .iter()
+                .filter_map(|name| self.vars.get(name).map(|var| copy(name, var)))
+                .collect(),
+        };
         sub.bar = bar;
         let value = sub.eval(expr);
+        self.steps = sub.steps;
+        self.out_of_budget |= sub.out_of_budget;
         for diagnostic in sub.diagnostics.drain(..) {
             if self
                 .reported
@@ -2104,6 +2343,7 @@ impl<'a> Evaluator<'a> {
         }
         slot.bars = std::mem::take(&mut sub.bars).into_owned();
         slot.ta = std::mem::take(&mut sub.ta);
+        slot.function_vars = std::mem::take(&mut sub.function_vars);
         for request in sub.security_requests.drain(..) {
             if !self.security_requests.contains(&request) {
                 self.security_requests.push(request);
@@ -2293,6 +2533,7 @@ impl<'a> Evaluator<'a> {
 
     fn call_function(
         &mut self,
+        id: NodeId,
         function: &'a Function,
         args: &[Arg],
         receiver: Option<Value>,
@@ -2333,6 +2574,8 @@ impl<'a> Evaluator<'a> {
             );
         }
         self.locals.push(scope);
+        self.function_path.push(id);
+        self.function_frames.push((self.locals.len() - 1, HashSet::new()));
         // A parameter the caller left out takes the default the script declared for it.
         for (at, default) in function.defaults.iter().enumerate() {
             let Some(default) = default else { continue };
@@ -2349,6 +2592,13 @@ impl<'a> Evaluator<'a> {
         let value = self.run_block(&function.body);
         self.control = control;
         self.depth -= 1;
+        let (scope_index, names) = self.function_frames.pop().unwrap();
+        for name in names {
+            if let Some(value) = self.locals[scope_index].get(&name) {
+                self.function_vars.insert((self.function_path.clone(), name), value.clone());
+            }
+        }
+        self.function_path.pop();
         self.locals.pop();
         value
     }
@@ -2650,10 +2900,13 @@ impl<'a> Evaluator<'a> {
             fields.insert("__columns".into(), Value::Num(columns as f64));
             fields.insert("__rows".into(), Value::Num(rows as f64));
             // `table.new(position.top_right, columns, rows, ...)`: the first argument is a member
-            // path, which is read as text so it is not evaluated as an unknown name.
+            // path, which is read as text so it is not evaluated as an unknown name. A script may
+            // also pass a variable holding that constant, which evaluates to the member's name.
             let position = args
                 .first()
-                .and_then(|arg| dotted(&arg.value))
+                .map(|arg| self.eval(&arg.value))
+                .and_then(|value| value.text().map(str::to_owned))
+                .or_else(|| args.first().and_then(|arg| dotted(&arg.value)))
                 .unwrap_or_else(|| "position.top_right".into());
             fields.insert("__position".into(), Value::Str(position));
             drop(fields);
@@ -2708,6 +2961,50 @@ impl<'a> Evaluator<'a> {
                         fields.remove(&format!("t:{column}:{row}"));
                     }
                 }
+            }
+            // `table.cell_set_text_color(table_id, column, row, color)` and its two siblings
+            // write the cell `table.cell` writes, without its width, height or alignment.
+            "cell_set_text" | "cell_set_text_color" | "cell_set_bgcolor" => {
+                let column = index(args.get(1).map(|arg| self.eval(&arg.value)));
+                let row = index(args.get(2).map(|arg| self.eval(&arg.value)));
+                let value = args
+                    .get(3)
+                    .map(|arg| self.eval(&arg.value))
+                    .unwrap_or(Value::Na);
+                let mut fields = value::lock_object(&shared);
+                if method == "cell_set_text" {
+                    let text = builtins::display(&value);
+                    match text.is_empty() {
+                        true => {
+                            fields.remove(&format!("c:{column}:{row}"));
+                        }
+                        false => {
+                            fields.insert(format!("c:{column}:{row}"), Value::Str(text));
+                        }
+                    }
+                    return Value::Na;
+                }
+                let key = format!(
+                    "{}:{column}:{row}",
+                    if method == "cell_set_bgcolor" { "b" } else { "t" }
+                );
+                match value.color() {
+                    Some(color) => {
+                        fields.insert(key, Value::Color(color));
+                    }
+                    None => {
+                        fields.remove(&key);
+                    }
+                }
+            }
+            "set_position" => {
+                let position = args
+                    .get(1)
+                    .map(|arg| self.eval(&arg.value))
+                    .and_then(|value| value.text().map(str::to_owned))
+                    .or_else(|| args.get(1).and_then(|arg| dotted(&arg.value)))
+                    .unwrap_or_else(|| "position.bottom_right".into());
+                value::lock_object(&shared).insert("__position".into(), Value::Str(position));
             }
             "clear" => {
                 let mut bound = |at: usize, fallback: usize| {
@@ -3056,13 +3353,13 @@ fn drawing_output(object: &value::ObjectRef) -> Option<DrawingOutput> {
             .unwrap_or_default()
             .to_owned()
     };
-    let style = fields
+    let style_text = fields
         .get("style")
         .and_then(Value::text)
         .unwrap_or("style_solid");
-    let style = if style.contains("dashed") {
+    let style = if style_text.contains("dashed") {
         egui_charts::model::LineStyle::Dashed
-    } else if style.contains("dotted") {
+    } else if style_text.contains("dotted") {
         egui_charts::model::LineStyle::Dotted
     } else {
         egui_charts::model::LineStyle::Solid
@@ -3082,6 +3379,8 @@ fn drawing_output(object: &value::ObjectRef) -> Option<DrawingOutput> {
             fill_color: None,
             width: number("width") as f32,
             style,
+            label_style: None,
+
             font_size,
         },
         DrawingKind::Label => DrawingOutput {
@@ -3095,6 +3394,8 @@ fn drawing_output(object: &value::ObjectRef) -> Option<DrawingOutput> {
             fill_color: colour("color"),
             width: 1.0,
             style,
+            label_style: Some(style_text.to_owned()),
+
             font_size,
         },
         DrawingKind::Box => DrawingOutput {
@@ -3108,6 +3409,8 @@ fn drawing_output(object: &value::ObjectRef) -> Option<DrawingOutput> {
             fill_color: colour("fill_color"),
             width: number("border_width") as f32,
             style,
+            label_style: None,
+
             font_size,
         },
         DrawingKind::Fill => {
@@ -3136,6 +3439,8 @@ fn drawing_output(object: &value::ObjectRef) -> Option<DrawingOutput> {
                 fill_color: colour("color"),
                 width: 0.0,
                 style,
+                label_style: None,
+
                 font_size,
             }
         }
@@ -3225,6 +3530,84 @@ fn mintick_text(value: f64, mintick: f64) -> String {
         2
     };
     format!("{value:.decimals$}")
+}
+
+/// The call sites a script reads with `[n]`, whose value on every bar
+/// [`Evaluator::call_history`] keeps for it.
+pub(crate) fn indexed_calls(body: &[Stmt]) -> HashSet<NodeId> {
+    let mut ids = HashSet::new();
+    ast::visit_stmts(body, &mut |expr| {
+        if let Expr::Index { target, .. } = expr
+            && let Expr::Call { id, .. } = &**target
+        {
+            ids.insert(*id);
+        }
+    });
+    ids
+}
+
+/// The script variables an expression can read, including through the functions it calls. A
+/// `request.security` request hands the chart's values only for these, so a request that reads
+/// bars alone copies nothing and stays cheap on a long history.
+fn referenced_vars(program: &Program, expr: &Expr) -> SecurityVars {
+    let mut functions: HashMap<&str, &Function> = HashMap::new();
+    for statement in &program.body {
+        if let Stmt::Function(function) = statement {
+            functions.insert(function.name.as_str(), function);
+        }
+    }
+    let mut names = HashSet::new();
+    let mut called = HashSet::new();
+    let mut all = false;
+    collect_names(expr, &functions, &mut names, &mut called, &mut all);
+    if all {
+        SecurityVars::All
+    } else {
+        SecurityVars::Named(names)
+    }
+}
+
+fn collect_names(
+    expr: &Expr,
+    functions: &HashMap<&str, &Function>,
+    names: &mut HashSet<String>,
+    called: &mut HashSet<String>,
+    all: &mut bool,
+) {
+    let mut queue: Vec<String> = Vec::new();
+    fn reading(
+        expr: &Expr,
+        names: &mut HashSet<String>,
+        queue: &mut Vec<String>,
+        all: &mut bool,
+    ) {
+        match expr {
+            Expr::Ident(name) => {
+                names.insert(name.clone());
+            }
+            // The setting holds the name of a series, so what it reads is only known at run time.
+            Expr::Call { callee, .. } if callee.join(".") == "input.source" => *all = true,
+            Expr::Call { callee, .. } if callee.len() == 1 => queue.push(callee[0].clone()),
+            _ => {}
+        }
+    }
+    expr.visit(&mut |expr| reading(expr, names, &mut queue, all));
+    while let Some(callee) = queue.pop() {
+        let Some(function) = functions.get(callee.as_str()).copied() else {
+            continue;
+        };
+        if !called.insert(callee) {
+            continue;
+        }
+        // A default argument fills a parameter even when the caller leaves it out, so it can
+        // read a chart value as well.
+        for default in function.defaults.iter().flatten() {
+            default.visit(&mut |expr| reading(expr, names, &mut queue, all));
+        }
+        ast::visit_stmts(&function.body, &mut |expr| {
+            reading(expr, names, &mut queue, all)
+        });
+    }
 }
 
 /// The namespaced name a v3/v4 script's bare builtin call means: `sma` is `ta.sma`, `abs` is
@@ -3346,17 +3729,18 @@ fn line_pattern(value: &Value) -> egui_charts::model::LineStyle {
     }
 }
 
-/// A stable colour for a plot that names none.
+/// The Pine `position.*` corner a table sits in, as the path or the member's bare name.
 fn table_position(name: Option<&str>) -> StudyTablePosition {
+    let name = name.map(|name| name.strip_prefix("position.").unwrap_or(name));
     match name {
-        Some("position.top_left") => StudyTablePosition::TopLeft,
-        Some("position.top_center") => StudyTablePosition::TopCenter,
-        Some("position.top_right") => StudyTablePosition::TopRight,
-        Some("position.middle_left") => StudyTablePosition::MiddleLeft,
-        Some("position.middle_center") => StudyTablePosition::MiddleCenter,
-        Some("position.middle_right") => StudyTablePosition::MiddleRight,
-        Some("position.bottom_left") => StudyTablePosition::BottomLeft,
-        Some("position.bottom_center") => StudyTablePosition::BottomCenter,
+        Some("top_left") => StudyTablePosition::TopLeft,
+        Some("top_center") => StudyTablePosition::TopCenter,
+        Some("top_right") => StudyTablePosition::TopRight,
+        Some("middle_left") => StudyTablePosition::MiddleLeft,
+        Some("middle_center") => StudyTablePosition::MiddleCenter,
+        Some("middle_right") => StudyTablePosition::MiddleRight,
+        Some("bottom_left") => StudyTablePosition::BottomLeft,
+        Some("bottom_center") => StudyTablePosition::BottomCenter,
         _ => StudyTablePosition::BottomRight,
     }
 }
@@ -3519,6 +3903,63 @@ fn closed_bars(bars: &[Bar], timeframe: egui_charts::model::Timeframe, now: i64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_locals_are_separate_for_each_function_call_site() {
+        let source = "indicator(\"Scopes\")\na(step) =>\n    var total = 0.0\n    total := total + step\n    total\nb(step) =>\n    var total = 100.0\n    total := total + step\n    total\nplot(a(1))\nplot(a(2))\nplot(b(3))\n";
+        let output = run(source, &[5.0, 6.0, 7.0]);
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert_eq!(output.plots[0].values, [1.0, 2.0, 3.0]);
+        assert_eq!(output.plots[1].values, [2.0, 4.0, 6.0]);
+        assert_eq!(output.plots[2].values, [103.0, 106.0, 109.0]);
+    }
+
+    #[test]
+    fn finer_security_uses_only_closed_bars_inside_each_chart_bar() {
+        let program = Parser::parse("indicator(\"Finer\")\nplot(request.security(syminfo.tickerid, \"1\", close))\n").unwrap();
+        let context = Context { symbol: "TEST".into(), timeframe: egui_charts::model::Timeframe::Min5, ..Context::default() };
+        let chart: Vec<_> = minute_bars(15).into_iter().step_by(5).collect();
+        let mut finer = minute_bars(10);
+        finer.retain(|b| b.time != Utc.with_ymd_and_hms(2024, 1, 1, 0, 7, 0).unwrap());
+        let sources = [SecurityData { symbol: "TEST".into(), timeframe: egui_charts::model::Timeframe::Min1, bars: finer }];
+        let output = Evaluator::new(&program, &chart, &context, &HashMap::new(), &sources).run();
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert_eq!(&output.plots[0].values[..2], &[5.0, 10.0]);
+        assert!(output.plots[0].values[2].is_nan());
+        assert_eq!(output.security_requests, [("TEST".into(), egui_charts::model::Timeframe::Min1)]);
+    }
+
+    #[test]
+    fn excessive_finer_history_reports_a_limit() {
+        let program = Parser::parse("indicator(\"Limit\")\nplot(request.security(syminfo.tickerid, \"1\", close))\n").unwrap();
+        let context = Context { symbol: "TEST".into(), timeframe: egui_charts::model::Timeframe::Min5, ..Context::default() };
+        let chart = minute_bars(1);
+        let sources = [SecurityData { symbol: "TEST".into(), timeframe: egui_charts::model::Timeframe::Min1, bars: minute_bars(10_001) }];
+        let output = Evaluator::new(&program, &chart, &context, &HashMap::new(), &sources).run();
+        assert!(output.diagnostics.iter().any(|d| d.message.contains("10,000 bars")));
+    }
+
+    #[test]
+    fn session_dates_follow_pacific_midnight() {
+        let program = Parser::parse("indicator(\"Day\")\nplot(session.isfirstbar ? 1 : 0)\nplot(session.islastbar ? 1 : 0)\n").unwrap();
+        let make = |hour, minute| Bar::new(Utc.with_ymd_and_hms(2024, 1, 3, hour, minute, 0).unwrap(), 1.0, 2.0, 0.0, 1.0, 1.0);
+        let bars = [make(7, 50), make(7, 55), make(8, 0)];
+        let context = Context { timeframe: egui_charts::model::Timeframe::Min5, timezone: "America/Los_Angeles".parse().unwrap(), ..Context::default() };
+        let output = Evaluator::new(&program, &bars, &context, &HashMap::new(), &[]).run();
+        assert_eq!(output.plots[0].values, [1.0, 0.0, 1.0]);
+        assert_eq!(output.plots[1].values, [0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn session_boundaries_use_chart_timezone_and_regular_hours() {
+        let program = Parser::parse("indicator(\"Session\")\nplot(session.isfirstbar ? 1 : 0)\nplot(session.isfirstbar_regular ? 1 : 0)\nplot(session.islastbar_regular ? 1 : 0)\n").unwrap();
+        let make = |h, m| Bar::new(Utc.with_ymd_and_hms(2024, 1, 2, h, m, 0).unwrap(), 1.0, 2.0, 0.0, 1.0, 1.0);
+        let bars = [make(17, 25), make(17, 30), make(23, 55), make(0, 0)];
+        let context = Context { timeframe: egui_charts::model::Timeframe::Min5, timezone: "America/Los_Angeles".parse().unwrap(), ..Context::default() };
+        let output = Evaluator::new(&program, &bars[..3], &context, &HashMap::new(), &[]).run();
+        assert_eq!(output.plots[1].values, [0.0, 1.0, 0.0]);
+        assert_eq!(output.plots[2].values, [0.0, 0.0, 1.0]);
+    }
     use crate::pine_engine::parser::Parser;
     use chrono::{TimeZone, Utc};
 
@@ -3684,6 +4125,30 @@ mod tests {
     }
 
     #[test]
+    fn historical_intraday_bars_read_completed_daily_ohlcv_without_future_data() {
+        use chrono::TimeZone;
+        let make = |day, hour, high, low, close| Bar::new(
+            chrono::Utc.with_ymd_and_hms(2024, 1, day, hour, 0, 0).unwrap(),
+            low, high, low, close, 10.0,
+        );
+        let chart = [make(2, 14, 20.0, 10.0, 15.0), make(3, 5, 30.0, 20.0, 25.0),
+            make(3, 15, 40.0, 20.0, 30.0), make(4, 5, 50.0, 30.0, 40.0)];
+        // The day-four daily bar is deliberately extreme: earlier chart bars must never read it.
+        let source = SecurityData { symbol: "TEST".into(), timeframe: egui_charts::model::Timeframe::Day1,
+            bars: vec![make(2, 14, 140.0, 90.0, 115.0), make(3, 14, 150.0, 100.0, 145.0), make(4, 14, 999.0, 1.0, 999.0)] };
+        let script = crate::pine_engine::Script::parse("//@version=4\nstudy(\"Previous day\")\nplot(security(syminfo.tickerid, 'D', high[1], timezone=\"America/New_York\"))\nplot(security(syminfo.tickerid, 'D', low[1], timezone=\"America/New_York\"))\nplot(security(syminfo.tickerid, 'D', close[1], timezone=\"America/New_York\"))\nplot(security(syminfo.tickerid, 'D', high[2], timezone=\"America/New_York\"))\n").unwrap();
+        let context = Context { symbol: "TEST".into(), timezone: "America/Los_Angeles".parse().unwrap(), ..Context::default() };
+        let output = script.run(&chart, &context, &[source]);
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert!(output.plots[0].values[0].is_nan());
+        assert_eq!(&output.plots[0].values[1..], &[140.0, 140.0, 150.0]);
+        assert_eq!(&output.plots[1].values[1..], &[90.0, 90.0, 100.0]);
+        assert_eq!(&output.plots[2].values[1..], &[115.0, 115.0, 145.0]);
+        assert!(output.plots[3].values[2].is_nan());
+        assert_eq!(output.plots[3].values[3], 140.0);
+    }
+
+    #[test]
     fn lookahead_on_reads_the_higher_bar_from_its_first_chart_bar() {
         let output = run_bars(
             "indicator(\"T\")\nplot(request.security(syminfo.tickerid, \"60\", close, lookahead = barmerge.lookahead_on))\nplot(request.security(syminfo.tickerid, \"60\", high[1], barmerge.gaps_off, barmerge.lookahead_on))\n",
@@ -3708,6 +4173,19 @@ mod tests {
         let values = &output.plots[0].values;
         // Hour closes are 60 and 120, so the two-bar average is 90 at 02:00.
         assert_eq!(values[120], 90.0);
+    }
+
+    /// A chart value a request reads, even through a function, comes from the chart's own state;
+    /// a request that reads bars alone copies none of it.
+    #[test]
+    fn request_security_reads_the_chart_value_a_function_returns() {
+        let output = run_bars(
+            "indicator(\"T\")\ndouble = close * 2\nshown() => double\nplot(request.security(syminfo.tickerid, \"60\", shown()))\n",
+            minute_bars(62),
+        );
+        let values = &output.plots[0].values;
+        assert!(values[59].is_nan(), "the first hour has not closed yet");
+        assert_eq!(values[60], 122.0);
     }
 
     #[test]
@@ -3822,6 +4300,37 @@ mod tests {
         assert_eq!(table.cell_bg, vec![vec![Some(Color32::RED), None]]);
         assert_eq!(table.cell_text, vec![vec![Some(Color32::WHITE), None]]);
         assert_eq!(table.position, StudyTablePosition::TopRight);
+    }
+
+    /// A script may keep its corner in a variable, as CISD does with its position input.
+    #[test]
+    fn a_table_takes_its_position_from_a_variable() {
+        let output = run(
+            "indicator(\"T\")\ntp = position.middle_right\nvar table t = table.new(tp, 1, 1)\ntable.cell(t, 0, 0, \"x\")\nplot(close)\n",
+            &[1.0],
+        );
+        assert_eq!(output.tables[0].position, StudyTablePosition::MiddleRight);
+    }
+
+    #[test]
+    fn table_setters_update_existing_cells_and_position() {
+        let source = r#"indicator("Dashboard")
+var table board = table.new(position.top_left, 1, 2)
+table.cell(board, 0, 0, "Heading")
+table.cell(board, 0, 1, "old")
+table.cell_set_text(board, 0, 1, "updated")
+table.cell_set_bgcolor(board, 0, 1, color.red)
+table.cell_set_text_color(board, 0, 1, color.white)
+table.set_position(board, position.bottom_right)
+plot(close)
+"#;
+        let output = run(source, &[3.0, 4.0]);
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let table = &output.tables[0];
+        assert_eq!(table.position, StudyTablePosition::BottomRight);
+        assert_eq!(table.rows[1][0], StudyCell::Text("updated".into()));
+        assert_eq!(table.cell_bg[1][0], Some(egui::Color32::RED));
+        assert_eq!(table.cell_text[1][0], Some(egui::Color32::WHITE));
     }
 
     #[test]
@@ -4408,6 +4917,62 @@ plot(dayofweek.monday == 2 ? 1 : 0)
         assert_eq!(output.plots[1].values[1], 1.0);
         assert_eq!(output.plots[2].values[1], 1.0);
         assert_eq!(output.plots[6].values[1], 1.0);
+    }
+
+    #[test]
+    fn na_only_reads_a_missing_value_as_missing() {
+        let output = run(
+            "indicator(\"T\")\ntype S\n    float v\n    label l\ns = S.new(1.0, label.new(bar_index, close, \"x\"))\nplot(na(s) ? 1 : 0)\nplot(na(s.l) ? 1 : 0)\nplot(na(close) ? 1 : 0)\nplot(na(close[999]) ? 1 : 0)\n",
+            &[1.0, 2.0],
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let at = |index: usize| output.plots[index].values[1];
+        // An object that exists is a value, even when one of its fields is `na`.
+        assert_eq!(at(0), 0.0);
+        assert_eq!(at(1), 0.0);
+        assert_eq!(at(2), 0.0);
+        assert_eq!(at(3), 1.0);
+    }
+
+    #[test]
+    fn a_call_reads_its_own_history_with_an_index() {
+        let output = run_bars(
+            "indicator(\"T\")\nplot(time(\"60\")[1])\nplot(ta.sma(close, 2)[1])\nplot(timeframe.in_seconds(\"1D\"))\n",
+            minute_bars(63),
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        // The bar before 01:01 opened at 00:00, and the first bar has nothing behind it.
+        assert!(output.plots[0].values[0].is_nan());
+        assert_eq!(output.plots[0].values[61], 1_704_070_800_000.0);
+        // The two-bar average of the bar before the third one.
+        assert_eq!(output.plots[1].values[2], 1.5);
+        assert_eq!(output.plots[2].values[0], 86_400.0);
+    }
+
+    #[test]
+    fn time_close_is_the_bar_open_plus_its_timeframe() {
+        let output = run_bars(
+            "indicator(\"T\")\nplot(time_close - time)\nplot(time_close(\"60\") - time)\n",
+            minute_bars(2),
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert_eq!(output.plots[0].values, [60_000.0, 60_000.0]);
+        // The first bar opens at midnight and its hour closes at 01:00; the second opens at 01:00.
+        assert_eq!(output.plots[1].values, [3_600_000.0, 3_540_000.0]);
+    }
+
+    #[test]
+    fn a_label_keeps_its_line_breaks() {
+        let output = run(
+            "indicator(\"T\")\nlabel.new(bar_index, high, \"4H\\n(1:02)\", style = label.style_label_down)\nlabel.new(bar_index, low, \"●\", style = label.style_label_up)\n",
+            &[1.0, 2.0],
+        );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let [.., above, below] = &output.drawings[..] else {
+            panic!("two labels, got {:?}", output.drawings);
+        };
+        assert_eq!(above.text, "4H\n(1:02)");
+        assert_eq!(below.text, "●");
     }
 
     #[test]
@@ -5088,13 +5653,14 @@ t = table.new(position.top_right, 3, 2, bgcolor=color.new(color.black, 50), bord
 if barstate.islast
     table.cell(t, 0, 0, "A", bgcolor=color.blue, text_color=color.white, text_size=size.small)
     table.cell(t, 1, 0, str.format("{0} {1,number,#.##}", "x", 1.234))
+    table.cell(t, 0, 1, "B", bgcolor=color.blue, text_color=color.white)
     table.merge_cells(t, 0, 1, 2, 1)
     table.set_position(t, position.bottom_left)
     table.set_bgcolor(t, color.new(color.navy, 80))
     table.set_border_color(t, color.gray)
     table.set_border_width(t, 2)
-    table.cell_set_text_color(t, 0, 0, color.yellow)
-    table.cell_set_bgcolor(t, 0, 0, color.olive)
+    table.cell_set_text_color(t, 0, 1, color.yellow)
+    table.cell_set_bgcolor(t, 0, 1, color.olive)
     table.cell_set_text(t, 1, 1, "upd")
     table.cell_set_text_size(t, 1, 1, size.large)
 l = label.new(bar_index, high, "x")
@@ -5121,6 +5687,19 @@ plot(close)
 "#;
         let output = run(script, &[10.0, 11.0]);
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let table = output.tables.first().expect("the table has cells");
+        assert_eq!(table.position, StudyTablePosition::BottomLeft);
+        assert_eq!(
+            table.rows,
+            [vec![
+                StudyCell::Text("B".into()),
+                StudyCell::Text("upd".into()),
+                StudyCell::Text(String::new())
+            ]]
+        );
+        let olive = Some(Color32::from_rgb(128, 128, 0));
+        assert_eq!(table.cell_bg, [vec![olive; 3]]);
+        assert_eq!(table.cell_text, [vec![Some(Color32::YELLOW); 3]]);
         let line = output
             .drawings
             .iter()

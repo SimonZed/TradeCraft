@@ -177,7 +177,14 @@ fn lex_line(
             at += 1;
             while at < bytes.len() && bytes[at] != quote {
                 if bytes[at] == '\\' && at + 1 < bytes.len() {
-                    text.push(bytes[at + 1]);
+                    // Pine writes a line break in a label as `\n`; other escaped characters
+                    // stand for themselves, as `\"` does.
+                    text.push(match bytes[at + 1] {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        escaped => escaped,
+                    });
                     at += 2;
                     continue;
                 }

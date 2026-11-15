@@ -1,4 +1,6 @@
 //@version=4
+// SPDX-FileCopyrightText: BB-levels original author and TradeCraft contributors
+// SPDX-License-Identifier: MIT
 study(title="BB levels - regular and premarket", shorttitle="BB levels", overlay=true)
 
 // Session times are New York time, regardless of the chart's display timezone.

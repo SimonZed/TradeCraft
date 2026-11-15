@@ -170,6 +170,7 @@ pub struct TerminalApp {
     menu_icon: Option<egui::TextureHandle>,
     pine: crate::pine_editor::PineEditor,
     pine_catalog_revision: u64,
+    options: crate::options_view::OptionsView,
 }
 impl TerminalApp {
     #[cfg(test)]
@@ -219,6 +220,7 @@ impl TerminalApp {
             menu_icon: None,
             pine,
             pine_catalog_revision: 0,
+            options: crate::options_view::OptionsView::default(),
         }
     }
     pub(crate) fn init_tray(&mut self, ctx: &egui::Context) {
@@ -248,7 +250,9 @@ impl TerminalApp {
         terminal.set_force_session_control(true);
         terminal.set_script_manager_available(true);
         terminal.set_time_controls_in_tabs(true);
+        terminal.panels_mut().watchlist.set_options_action(true);
         let toolbar = terminal.top_toolbar_mut();
+        toolbar.host_inline_action = Some(("options".into(), "Options".into(), egui::Color32::from_rgb(255, 100, 0), 18.0));
         toolbar
             .host_menu_entries
             .push(("market-data-settings".into(), "Market data settings".into()));
@@ -547,10 +551,13 @@ impl TerminalApp {
         });
         let toolbar = self.terminal.top_toolbar_mut();
         toolbar.host_menu_image = Some((icon.id(), egui::vec2(24.0, 24.0)).into());
-        toolbar.host_status = Some(if self.alert_error.is_empty() {
+        let status = if self.alert_error.is_empty() {
             label
         } else {
             format!("{label} · {}", self.alert_error)
+        };
+        egui::Panel::bottom("tradecraft_connection_status").show(ui, |ui| {
+            ui.label(status);
         });
         let overrides = if self.settings.provider == Provider::Tradier {
             self.feed.calendar_overrides()
@@ -566,6 +573,12 @@ impl TerminalApp {
             }
             chart.show(ui)
         }) {
+            if matches!(action, egui_charts_terminal::Action::TopToolbar(TopToolbarAction::Host(ref id)) if id == "options") {
+                self.options.open_for(self.terminal.chart().symbol(), self.settings);
+            }
+            if let egui_charts_terminal::Action::Watchlist(egui_charts::ui::widget_bar::panels::WatchlistAction::Options(ref symbol)) = action {
+                self.options.open_for(symbol, self.settings);
+            }
             if matches!(action, egui_charts_terminal::Action::TopToolbar(TopToolbarAction::Host(ref id)) if id == "market-data-settings")
             {
                 self.draft = self.settings;
@@ -588,6 +601,9 @@ impl TerminalApp {
             }
         }
         self.pine.show(ui.ctx(), self.terminal.chart_mut());
+        if let Some(symbol) = self.options.show(ui.ctx(), self.settings) {
+            self.terminal.open_symbol_tab(&symbol);
+        }
         if self.pine.revision != self.pine_catalog_revision {
             self.terminal
                 .set_indicator_factory(indicator_factory(&self.pine.library));
@@ -1719,6 +1735,33 @@ mod tests {
         }
         panic!("Missing candle was not restored: {}", feed.status());
     }
+    #[test]
+    fn option_chart_tab_displays_readable_contract_name() {
+        let mut app = TerminalApp::new();
+        app.terminal.chart_mut().set_symbol("SPY261116C00755000");
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 800.0))
+            .build_ui_state(|ui, app: &mut TerminalApp| app.show_ui(ui), app);
+        h.run_steps(3);
+        assert!(h.query_by_label("SPY 755C").is_some());
+        assert_eq!(h.state().terminal.chart().symbol(), "SPY261116C00755000");
+    }
+
+    #[test]
+    fn options_toolbar_opens_for_active_instrument() {
+        let mut app = TerminalApp::new();
+        app.settings.provider = Provider::Yahoo;
+        app.terminal.chart_mut().set_symbol("SPY");
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 800.0))
+            .build_ui_state(|ui, app: &mut TerminalApp| app.show_ui(ui), app);
+        h.run_steps(3);
+        h.get_by_label("Options").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Options · SPY").is_some());
+        assert!(h.query_by_label("Select Tradier in Market data settings to view options.").is_some());
+    }
+
     #[test]
     fn market_data_settings_are_accessible() {
         let mut h = egui_kittest::Harness::builder()

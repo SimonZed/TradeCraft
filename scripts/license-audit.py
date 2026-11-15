@@ -75,7 +75,7 @@ def main():
         destination.mkdir(parents=True, exist_ok=True)
         # Older package scripts wrote an inventory here; do not ship a stale one.
         (destination / "dependencies" / "INDEX.md").unlink(missing_ok=True)
-        for name in ("LICENSE", "ATTRIBUTION.md", "ARCHITECTURE.md"):
+        for name in ("LICENSE", "ATTRIBUTION.md", "ARCHITECTURE.md", "README.md"):
             shutil.copy2(ROOT / name, destination / name)
         for relative in ("LICENSE-MIT", "LICENSE-APACHE", "THIRD-PARTY-NOTICES.md", "assets/icons/LICENSE-lucide.txt", "assets/fonts/LICENSE-roboto.txt"):
             output = destination / "vendor" / "egui-charts" / relative

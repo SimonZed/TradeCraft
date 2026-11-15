@@ -25,6 +25,19 @@ const LINK_MARKERS: [(&str, egui::Color32); 5] = [
     ("💩", egui::Color32::from_rgb(160, 105, 90)),
 ];
 
+/// Paints `chart`'s background over `rect`, the container a chart with `skip_background` set
+/// leaves its background to.
+fn slot_background(ui: &Ui, rect: Rect, chart: &Chart) {
+    let config = chart.config();
+    super::frame::paint_background(
+        ui.painter(),
+        rect,
+        rect,
+        config.background_style,
+        config.background_color,
+    );
+}
+
 // These markers must also work in hosts without emoji fonts.
 fn paint_link_marker(ui: &Ui, rect: Rect, marker: &str) {
     let Some(index) = LINK_MARKERS.iter().position(|(name, _)| *name == marker) else {
@@ -109,6 +122,7 @@ pub use drawings::{SymbolDrawing, SymbolDrawings};
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
+#[non_exhaustive]
 pub enum ChartLayoutMode {
     /// One chart.
     #[default]
@@ -903,12 +917,16 @@ impl LayoutEditLink {
 
 /// Independent synchronization switches within each layout group.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ChartSyncOptions {
     /// Synchronize scrolling and zooming using UTC plot edges.
     pub sync_time_axis: bool,
     /// Synchronize the hovered timestamp.
     pub sync_crosshair: bool,
     /// Synchronize completed main-pane drawings between charts of the same symbol.
+    /// A chart that comes to a symbol receives the drawings mirrored there. Turning this on links
+    /// equal drawings of the charts of a symbol and mirrors the others both ways, without replaying
+    /// what was done while it was off.
     /// Study-owned drawings stay local because study ids and scales belong to each chart.
     /// Charts that keep their drawings in the same storage are left to it: they read each other's
     /// stored drawings whether this is on or off, so a drawing reaches them once a chart history
@@ -991,6 +1009,18 @@ pub struct ChartLayout {
     previous_preset: Option<(ChartLayoutMode, usize)>,
     sizing: SizingState,
     edits: LayoutEdits,
+}
+
+impl std::fmt::Debug for ChartLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChartLayout")
+            .field("mode", &self.mode)
+            .field("sync", &self.sync)
+            .field("text_sync_groups", &self.text_sync_groups)
+            .field("active", &self.active)
+            .field("maximized", &self.maximized)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Identifies a chart's bars: it changes when they are replaced, not when they stream.
@@ -1181,7 +1211,7 @@ impl ChartLayout {
                         .iter()
                         .filter(|chart| chart.history.holds_layout_edit(*id))
                     {
-                        if chart.history.blocked() {
+                        if chart.history_blocked() {
                             return false;
                         }
                         belongs = true;
@@ -1543,8 +1573,16 @@ impl ChartLayout {
             self.active = index;
         }
         // A chart supplied or restored in a slot starts a new baseline: nothing changed in it.
+        #[cfg(feature = "drawings")]
+        let known = self.previous_charts;
         for (index, chart) in charts.iter().enumerate() {
             if self.previous_charts[index] != chart.layout_identity {
+                // A chart new to the layout brings drawings new to it, while one that
+                // `swap_slots` moved keeps its links.
+                #[cfg(feature = "drawings")]
+                if !known.contains(&chart.layout_identity) {
+                    self.drawings.forget_slot(index);
+                }
                 self.previous_charts[index] = chart.layout_identity;
                 self.previous[index] = None;
                 self.previous_ranges[index] = None;
@@ -1688,6 +1726,7 @@ impl ChartLayout {
                             .horizontal(|ui| self.link_controls(ui, index, false))
                             .inner;
                         egui::CentralPanel::default().show(ui, |ui| {
+                            slot_background(ui, ui.max_rect(), chart);
                             let response = render(ui, index, chart);
                             if focus {
                                 response.request_focus();
@@ -1719,8 +1758,7 @@ impl ChartLayout {
                 continue;
             }
             let rect = rects[index];
-            ui.painter()
-                .rect_filled(rect, 0.0, charts[index].config().background_color);
+            slot_background(ui, rect, charts[index]);
             ui.scope_builder(
                 egui::UiBuilder::new()
                     .max_rect(rect)
@@ -1871,23 +1909,28 @@ impl ChartLayout {
             ui.ctx().request_repaint();
         }
         #[cfg(feature = "drawings")]
-        if (self.sync.sync_drawings
-            || charts.iter().take(total).any(|chart| {
-                chart
-                    .drawings()
-                    .drawings
-                    .iter()
-                    .any(|d| d.folder_sync_mode().is_some())
-            }))
-            && self.drawings.sync(
+        {
+            let tracking = self.sync.sync_drawings
+                || charts.iter().take(total).any(|chart| {
+                    chart
+                        .drawings()
+                        .drawings
+                        .iter()
+                        .any(|d| d.folder_sync_mode().is_some())
+                });
+            if !tracking {
+                // Turning the switch on is the first time for the drawings it mirrors, while
+                // those that their folder mirrors stay linked on the charts away from them.
+                self.drawings.forget_switched(charts, total);
+            } else if self.drawings.sync(
                 charts,
                 total,
                 &self.groups,
                 pointer_down,
                 self.sync.sync_drawings,
-            )
-        {
-            ui.ctx().request_repaint();
+            ) {
+                ui.ctx().request_repaint();
+            }
         }
         #[cfg(feature = "drawings")]
         if Chart::share_stored_drawings(charts) {
@@ -2233,6 +2276,55 @@ mod tests {
         chart.set_symbol("SAMPLE");
         chart.set_timeframe(Timeframe::Min1);
         chart
+    }
+
+    /// A chart that leaves its background to the layout gets its gradient over its slot.
+    #[test]
+    fn layout_paints_a_gradient_background() {
+        use crate::config::BackgroundStyle;
+        use egui::Color32;
+        let (top, bottom) = (Color32::from_rgb(200, 0, 0), Color32::from_rgb(0, 0, 200));
+        let mut chart = chart(60);
+        chart.config_mut().skip_background = true;
+        chart.config_mut().background_style = BackgroundStyle::VerticalGradient {
+            top_color: top,
+            bottom_color: bottom,
+        };
+        let size = vec2(800.0, 600.0);
+        let output = egui::Context::default().run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                ..Default::default()
+            },
+            |ui| {
+                ChartLayout::default().show(ui, &mut [&mut chart]);
+            },
+        );
+        let slot = ChartLayout::default().rects(Rect::from_min_size(Pos2::ZERO, size), 1)[0];
+        let meshes: Vec<Vec<_>> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) => Some(
+                    mesh.vertices
+                        .iter()
+                        .map(|vertex| (vertex.pos, vertex.color))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        // The slot's fill is painted before the chart, so it is the first mesh.
+        assert_eq!(
+            meshes.first(),
+            Some(&vec![
+                (slot.left_top(), top),
+                (slot.right_top(), top),
+                (slot.right_bottom(), bottom),
+                (slot.left_bottom(), bottom),
+            ])
+        );
     }
 
     /// Split size and link membership steps follow the layout value that shows their chart: a host

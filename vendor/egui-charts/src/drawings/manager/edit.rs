@@ -278,6 +278,7 @@ impl DrawingManager {
     /// Applies `edit` to the drawing with the given ID, records it for undo and queues it to
     /// be saved. Edit a drawing through this rather than [`Self::drawings`] so the change is
     /// saved. A locked drawing accepts only visibility, name and folder changes, or an edit that unlocks it.
+    /// An edit that hides the drawing deselects it.
     /// Does nothing if there is no such drawing.
     pub fn edit_drawing(&mut self, id: usize, edit: impl FnOnce(&mut Drawing)) {
         if let Some(drawing) = self.drawings.iter_mut().find(|d| d.id == id) {
@@ -304,7 +305,7 @@ impl DrawingManager {
                 drawing.folder = folder;
                 drawing.folder_sync = folder_sync;
             }
-            if !drawing.selectable {
+            if !drawing.selectable || (old.visible && !drawing.visible) {
                 self.selection.deselect(id);
             }
             self.queue_edit(&old);
@@ -343,6 +344,7 @@ impl DrawingManager {
 
     /// Edits live drawing ids as one undo step and queues their saved changes.
     /// Locked drawings accept visibility, name and folder changes, or an edit that unlocks them.
+    /// The drawings the edit hides are deselected.
     pub fn edit_drawings(&mut self, ids: &[usize], mut edit: impl FnMut(&mut Drawing)) {
         if ids.is_empty() {
             return;
@@ -380,7 +382,7 @@ impl DrawingManager {
                 drawing.folder = folder;
                 drawing.folder_sync = folder_sync;
             }
-            if !drawing.selectable {
+            if !drawing.selectable || (old.visible && !drawing.visible) {
                 self.selection.deselect(old.id);
             }
             before.push((index, old));
@@ -529,14 +531,15 @@ impl DrawingManager {
 
     // === Visibility ===
 
-    /// Toggles the visibility of all drawings. If all are visible, hides them
-    /// all; otherwise shows them all.
+    /// Hides every drawing unless all of them are already hidden, in which case shows them all,
+    /// as the Hide drawings toolbar entry does. Does nothing without drawings.
     pub fn toggle_visibility_all(&mut self) {
-        let visible = !self.drawings.iter().all(|drawing| drawing.visible);
+        let visible = self.drawings.iter().all(|drawing| !drawing.visible);
         self.set_visibility_all(visible);
     }
 
-    /// Set every drawing's visibility as one undoable edit.
+    /// Set every drawing's visibility as one undoable edit. Hiding deselects the drawings it hides;
+    /// undo restores their visibility, not the selection.
     pub fn set_visibility_all(&mut self, visible: bool) {
         let mut before = Vec::new();
         for (index, drawing) in self
@@ -560,6 +563,9 @@ impl DrawingManager {
         }
         for (_, drawing) in &before {
             self.stamp(drawing.id);
+            if !visible {
+                self.selection.deselect(drawing.id);
+            }
         }
         self.history.push_snapshot(before);
     }
@@ -900,5 +906,30 @@ mod tests {
         assert_eq!(manager.drawings.len(), 1);
         assert!(manager.undo());
         assert_eq!(folders(&manager), before);
+    }
+
+    /// Redo restores an added drawing as it was when the add was undone, with the bar spacing
+    /// its text was first displayed at, which the drawing adopts after its undo step is recorded.
+    #[test]
+    fn redo_keeps_the_spacing_added_text_was_first_shown_at() {
+        let mut manager = DrawingManager::new();
+        let mut text = Drawing::new(0, DrawingToolType::TextLabel);
+        text.text = Some("Note".into());
+        text.text_follows_zoom = true;
+        text.chart_points = vec![ChartPoint::new(10.0, 100.0)];
+        let id = manager.add_drawing(text).unwrap();
+        // First shown at 6 points a bar, then zoomed in to 12.
+        manager.update_all_screen_coords(|bar: f32| bar * 6.0, |price: f64| price as f32);
+        let at_12 = |bar: f32| bar * 12.0;
+        manager.update_all_screen_coords(at_12, |price: f64| price as f32);
+        let zoom = |manager: &DrawingManager| {
+            let text = manager.drawings.iter().find(|d| d.id == id).unwrap();
+            text.text_zoom(at_12, at_12(10.0))
+        };
+        // Sized at 6 points a bar and shown at 12, the text is drawn at 12 / 6 = 2 times its size.
+        assert_eq!(zoom(&manager), 2.0, "before the undo");
+        assert!(manager.undo() && manager.redo());
+        manager.update_all_screen_coords(at_12, |price: f64| price as f32);
+        assert_eq!(zoom(&manager), 2.0, "after the redo");
     }
 }

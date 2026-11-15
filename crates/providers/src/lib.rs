@@ -18,3 +18,4 @@ pub mod market;
 pub mod reference;
 pub mod settings;
 pub mod shared_stream;
+pub mod options;

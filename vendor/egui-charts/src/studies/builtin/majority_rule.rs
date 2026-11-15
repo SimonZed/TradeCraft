@@ -4,11 +4,32 @@ use crate::studies::stepper::{update_window, usable_behind};
 use crate::studies::{Indicator, IndicatorValue, IndicatorValues};
 use egui::Color32;
 
-/// Majority Rule - counts up vs down closes over period.
-/// Outputs +1 if majority up, -1 if majority down, 0 if tie.
+/// What [`MajorityRule`] reports for each window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MajorityMode {
+    /// 100 times the share of the window's closes that rose above the close before. Equal and
+    /// falling closes count against it.
+    Percentage,
+    /// +1 when more closes rose than fell, -1 when more fell, 0 when the counts are equal.
+    Direction,
+}
+
+impl MajorityMode {
+    const ALL: [Self; 2] = [Self::Percentage, Self::Direction];
+}
+
+/// Majority Rule: the share of the last `period` bars whose close rose above the close before.
+///
+/// In [`MajorityMode::Percentage`] (the default) it outputs the percentage of rising closes; in
+/// [`MajorityMode::Direction`] it outputs +1 if the majority rose, -1 if the majority fell and 0
+/// on a tie. A bar without a finite close has no value and does not break the window. The first
+/// bar has no close before it and counts as not rising, so the first value is at bar
+/// `period - 1`. In percentage mode the pane has a dashed guide at 50, where rising and other
+/// closes are evenly split.
 #[derive(Clone)]
 pub struct MajorityRule {
     period: usize,
+    mode: MajorityMode,
     values: IndicatorValues,
     colors: Vec<Color32>,
     visible: bool,
@@ -19,16 +40,24 @@ impl MajorityRule {
     pub fn new(period: usize) -> Self {
         Self {
             period: period.max(1),
+            mode: MajorityMode::Percentage,
             values: IndicatorValues::new(),
             colors: vec![Color32::from_rgb(255, 82, 82)],
             visible: true,
         }
     }
+
+    /// Choose the percentage of rising closes or the signed direction.
+    pub fn with_mode(mut self, mode: MajorityMode) -> Self {
+        self.mode = mode;
+        self
+    }
 }
 
 impl Default for MajorityRule {
+    /// A lookback of 14 bars.
     fn default() -> Self {
-        Self::new(10)
+        Self::new(14)
     }
 }
 
@@ -40,11 +69,9 @@ impl MajorityRule {
             return values;
         }
 
-        // First bar has no previous close to compare
-        values.push(IndicatorValue::None);
-
-        for i in 1..data.len() {
-            if i < self.period {
+        // The first bar has no close before it and counts as not rising.
+        for i in 0..data.len() {
+            if i + 1 < self.period {
                 values.push(IndicatorValue::None);
                 continue;
             }
@@ -64,12 +91,9 @@ impl MajorityRule {
                 }
             }
 
-            let result = if up_count > down_count {
-                1.0
-            } else if down_count > up_count {
-                -1.0
-            } else {
-                0.0
+            let result = match self.mode {
+                MajorityMode::Percentage => 100.0 * f64::from(up_count) / self.period as f64,
+                MajorityMode::Direction => f64::from((up_count - down_count).signum()),
             };
 
             values.push(IndicatorValue::Single(result));
@@ -87,15 +111,23 @@ impl Indicator for MajorityRule {
     }
 
     crate::studies::inputs::study_inputs!(self;
-        period: length("Period", 1, usize::MAX)
+        period: length("Period", 1, usize::MAX),
+        mode: choice("Output", MajorityMode::ALL)
     ; {});
+
+    fn value_format(&self) -> crate::scales::StudyFormat {
+        match self.mode {
+            MajorityMode::Percentage => crate::scales::StudyFormat::Percent,
+            MajorityMode::Direction => crate::scales::StudyFormat::Fixed(2),
+        }
+    }
 
     fn name(&self) -> &str {
         "MajRule"
     }
 
     fn desc(&self) -> &str {
-        "Majority Rule - +1 if majority up closes, -1 if majority down, 0 if tie"
+        "Majority Rule - percentage of rising closes, or +1 / -1 / 0 for the majority direction"
     }
 
     fn calculate(&mut self, data: &[Bar]) {
@@ -136,6 +168,18 @@ impl Indicator for MajorityRule {
         false
     }
 
+    fn pane(&self) -> crate::studies::StudyPane {
+        crate::studies::StudyPane {
+            levels: match self.mode {
+                MajorityMode::Percentage => {
+                    vec![(50.0, crate::studies::palette::GRAY, "Middle guide")]
+                }
+                MajorityMode::Direction => Vec::new(),
+            },
+            ..Default::default()
+        }
+    }
+
     fn is_visible(&self) -> bool {
         self.visible
     }
@@ -149,6 +193,170 @@ impl Indicator for MajorityRule {
     }
 
     fn line_names(&self) -> Vec<String> {
-        vec![format!("MajRule({})", self.period)]
+        let mode = match self.mode {
+            MajorityMode::Percentage => "Percentage",
+            MajorityMode::Direction => "Direction",
+        };
+        vec![format!("MajRule({}, {mode})", self.period)]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bars whose open, high and low lie away from the close the rule reads.
+    fn bars(closes: &[f64]) -> Vec<Bar> {
+        closes
+            .iter()
+            .enumerate()
+            .map(|(i, &close)| {
+                let time = chrono::DateTime::from_timestamp(i as i64 * 60, 0).unwrap();
+                Bar::new(time, close - 0.5, close + 2.0, close - 1.0, close, 1.0)
+            })
+            .collect()
+    }
+
+    /// Both outputs over three changes, by hand. The bar without a close has no value and is
+    /// skipped, so the closes read 10, 12, 12, 11, 13, 14, 14, 9, 8. Bar 2 sees the first bar,
+    /// which counts as not rising, up and equal (33.33 %, +1); bar 3 sees up, equal, down
+    /// (33.33 %, tie); bar 5 sees equal, down, up (33.33 %, tie); bar 6 sees down, up, up
+    /// (66.67 %, +1); bar 7 sees up, up, equal (66.67 %, +1); bar 8 sees up, equal, down
+    /// (33.33 %, tie); bar 9 sees equal, down, down (0 %, -1). Correcting the close of bar 6 from
+    /// 14 to 12 changes bars 6 to 9: bar 6 sees down, up, down (33.33 %, -1); bar 7 up, down, up
+    /// (66.67 %, +1); bar 8 down, up, down (33.33 %, -1); bar 9 up, down, down (33.33 %, -1).
+    #[test]
+    fn both_outputs_follow_the_rising_closes_through_ties_a_gap_and_a_correction() {
+        let third = 100.0 / 3.0;
+        let none = f64::NAN;
+        let mut closes = [10.0, 12.0, 12.0, 11.0, f64::NAN, 13.0, 14.0, 14.0, 9.0, 8.0];
+        let saved = [
+            (
+                MajorityMode::Percentage,
+                [
+                    none,
+                    none,
+                    third,
+                    third,
+                    none,
+                    third,
+                    2.0 * third,
+                    2.0 * third,
+                    third,
+                    0.0,
+                ],
+            ),
+            (
+                MajorityMode::Direction,
+                [none, none, 1.0, 0.0, none, 0.0, 1.0, 1.0, 0.0, -1.0],
+            ),
+        ];
+        let corrected = [
+            (
+                MajorityMode::Percentage,
+                [
+                    none,
+                    none,
+                    third,
+                    third,
+                    none,
+                    third,
+                    third,
+                    2.0 * third,
+                    third,
+                    third,
+                ],
+            ),
+            (
+                MajorityMode::Direction,
+                [none, none, 1.0, 0.0, none, 0.0, -1.0, 1.0, -1.0, -1.0],
+            ),
+        ];
+        let fresh = |mode, closes: &[f64]| {
+            let mut study = MajorityRule::new(3).with_mode(mode);
+            study.calculate(&bars(closes));
+            study
+        };
+        let check = |study: &MajorityRule, want: &[f64; 10]| {
+            for (bar, want) in want.iter().enumerate() {
+                let got = study.values().value(0, bar).unwrap_or(f64::NAN);
+                let equal = (got.is_nan() && want.is_nan()) || (got - want).abs() < 1e-9;
+                assert!(equal, "bar {bar}: {got}, not {want}");
+            }
+        };
+        let studies: Vec<_> = saved
+            .iter()
+            .map(|(mode, _)| fresh(*mode, &closes))
+            .collect();
+        for (study, (_, want)) in studies.iter().zip(&saved) {
+            check(study, want);
+        }
+        closes[6] = 12.0;
+        for (study, (mode, want)) in studies.iter().zip(&corrected) {
+            let mut study = study.clone();
+            study.update(&bars(&closes), 6);
+            check(&study, want);
+            check(&fresh(*mode, &closes), want);
+        }
+    }
+
+    /// At length `n` the first value is at bar `n - 1`, the first bar counting as not rising.
+    /// Length 3 on closes 10, 11, 10, 12: bar 2 sees the first bar, up, down (33.33 %, tie) and
+    /// bar 3 up, down, up (66.67 %, +1). Length 1: bar 0 is the first bar (0 %, tie), then up,
+    /// down, up (100 %, +1; 0 %, -1; 100 %, +1).
+    #[test]
+    fn the_first_value_is_at_the_bar_before_the_length() {
+        let third = 100.0 / 3.0;
+        let none = f64::NAN;
+        let data = bars(&[10.0, 11.0, 10.0, 12.0]);
+        for (length, mode, want) in [
+            (
+                3,
+                MajorityMode::Percentage,
+                [none, none, third, 2.0 * third],
+            ),
+            (3, MajorityMode::Direction, [none, none, 0.0, 1.0]),
+            (1, MajorityMode::Percentage, [0.0, 100.0, 0.0, 100.0]),
+            (1, MajorityMode::Direction, [0.0, 1.0, -1.0, 1.0]),
+        ] {
+            let mut study = MajorityRule::new(length).with_mode(mode);
+            study.calculate(&data);
+            for (bar, want) in want.iter().enumerate() {
+                let got = study.values().value(0, bar).unwrap_or(f64::NAN);
+                let equal = (got.is_nan() && want.is_nan()) || (got - want).abs() < 1e-9;
+                assert!(
+                    equal,
+                    "length {length}, {mode:?}, bar {bar}: {got}, not {want}"
+                );
+            }
+        }
+    }
+
+    /// A Majority Rule from the catalogue opens at length 14 with a dashed grey guide at 50, and
+    /// one in direction mode has no guide.
+    #[test]
+    fn a_new_study_has_length_14_and_a_middle_guide_for_the_percentage() {
+        let study = crate::studies::IndicatorFactory::new()
+            .create("MajRule")
+            .unwrap();
+        let period = study
+            .inputs()
+            .into_iter()
+            .find(|input| input.id == "period")
+            .map(|input| input.value);
+        assert_eq!(period, Some(crate::studies::InputValue::Length(14)));
+        let levels: Vec<_> = study
+            .pane()
+            .levels
+            .into_iter()
+            .map(|(value, color, _)| (value, color))
+            .collect();
+        assert_eq!(levels, [(50.0, crate::studies::palette::GRAY)]);
+        assert_eq!(
+            study.settings().levels[0].pattern,
+            crate::model::LineStyle::Dashed
+        );
+        let direction = MajorityRule::default().with_mode(MajorityMode::Direction);
+        assert!(direction.pane().levels.is_empty());
     }
 }

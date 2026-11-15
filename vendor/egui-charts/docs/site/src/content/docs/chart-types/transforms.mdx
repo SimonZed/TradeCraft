@@ -67,12 +67,14 @@ These main renderers share the parameter workflow above:
 | --- | --- | --- |
 | `Kagi` | Close by default, or `kagi_source` high/low; `kagi_reversal` in price units and `kagi_size_method` | Chart up/down colours and `styles.kagi` thick/thin widths; [`KagiConfig`](https://userfrm.github.io/egui-charts/docs/api/egui_charts/model/kagi/struct.KagiConfig.html) |
 | `LineBreak` | Close by default, or `line_break_source` high/low; `line_break_count` reversal lookback, 1 to 10 | Chart up/down colours; [`LineBreakConfig`](https://userfrm.github.io/egui-charts/docs/api/egui_charts/model/line_break/struct.LineBreakConfig.html) |
-| `Range` | Retained executions in order, or an OHLC path approximation when no trades are held; `range_size` and `range_size_method` | Chart up/down colours; [`RangeBarSource`](https://userfrm.github.io/egui-charts/docs/api/egui_charts/model/range_bar/enum.RangeBarSource.html), [`RangeBarConfig`](https://userfrm.github.io/egui-charts/docs/api/egui_charts/model/range_bar/struct.RangeBarConfig.html) |
+| `Range` | Retained executions in order, after the OHLC path approximation of the bars before the one holding the first retained trade, or that approximation alone when no trades are held; `range_size` and `range_size_method` | Chart up/down colours; [`RangeBarSource`](https://userfrm.github.io/egui-charts/docs/api/egui_charts/model/range_bar/enum.RangeBarSource.html), [`RangeBarConfig`](https://userfrm.github.io/egui-charts/docs/api/egui_charts/model/range_bar/struct.RangeBarConfig.html) |
 
 [`ChartTypeParams`](https://userfrm.github.io/egui-charts/docs/api/egui_charts/model/struct.ChartTypeParams.html)
 holds all these fields. For high/low input, intrabar order is unknown: continuation
 takes priority over reversal and at most one direction is processed per source
 bar. OHLC range bars are an approximation; original executions give their actual path.
+When trades start after OHLC history, the approximated range bars stay in front of the
+bars built from the trades, and the range in progress at the first trade gives way to them.
 See the [order-flow guide](../../../../../order-flow.md) for supplying executions.
 
 ## Sizes, styles and axis restrictions
@@ -94,8 +96,15 @@ are specific to `Candles`; they are not universal transform settings.
 
 Renko, Kagi, Line Break, Point and Figure, and Range have one time-scale slot per
 displayed element. Chart indices on those types count elements, not source bars.
-Studies, drawings, markers and added price series remain stored but are hidden;
-studies continue updating. Volume is also hidden. Returning to a time-based type
-shows these overlays again. These five types cannot be added series:
+Studies, drawings and markers are drawn at the element that contains their time:
+an element covers the interval up to its completion, and a Point and Figure column
+also covers the quiet bars up to the next column. A time before the loaded
+elements or outside the source history has no slot, so nothing is drawn for it.
+Studies are calculated from the element values and keep updating. Added price
+series are drawn too: each bar is placed by its time on the element axis, at the
+slot of an element with the same completion time, between two slots in proportion
+to the time between those completions, and past either end at that end's spacing.
+Volume is hidden on these types. Returning to a time-based type restores the
+time axis of the source bars. These five types cannot be added series:
 [`SeriesOptions::chart_type`](https://userfrm.github.io/egui-charts/docs/api/egui_charts/widget/struct.SeriesOptions.html#structfield.chart_type)
 converts them to `Line`. See [all added-series restrictions](../chart-types.mdx#added-series-restrictions).

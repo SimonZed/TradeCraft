@@ -36,6 +36,9 @@ impl PriceFormatter for DisplayFormatLabels {
 impl Chart {
     /// Formats a timestamp with the chart's zone, clock visibility and interval, or the median
     /// spacing of the source bars in or nearest the view for inferred and trade-based intervals.
+    /// Bars of a day or longer given without a feed read in UTC, where they carry their trading
+    /// date, under a display zone behind UTC unless they sit at its midnight; see the time zones
+    /// guide.
     /// On a [horizontal scale](Self::set_horizontal_scale), formats its key as the crosshair does.
     /// Hosts can use this for data windows and other readouts beside the chart.
     pub fn format_time(&self, time: chrono::DateTime<chrono::Utc>) -> String {
@@ -154,7 +157,7 @@ impl Chart {
         crate::scales::median_bar_duration(bars[at..end].iter().map(|bar| bar.time)).num_seconds()
     }
 
-    pub(super) fn display_timezone(&self) -> crate::scales::TimezoneMode {
+    pub(crate) fn display_timezone(&self) -> crate::scales::TimezoneMode {
         match &self.chart_options.time_scale.timezone {
             crate::scales::TimezoneMode::Exchange(fallback) => {
                 crate::scales::TimezoneMode::Exchange(
@@ -168,12 +171,56 @@ impl Chart {
         }
     }
 
+    /// The zone that dates the bars. Supplied bars of a day or longer carry their trading date at
+    /// 00:00 UTC. A display zone behind UTC shows that stamp as the evening before, so there they
+    /// read in UTC unless they sit at its midnight; UTC gives a bar at that midnight the same
+    /// date. Other zones keep the date of the stamp and of their own midnight, so they read in
+    /// the display zone, as intraday bars and the bars of the chart's feed always do. Bar replay
+    /// decides on the history it retains, since its window is cut on this zone's calendar.
+    /// `bar_seconds` gives [`time_label_seconds`](Self::time_label_seconds), read only for
+    /// supplied bars on a time interval.
+    pub(crate) fn label_timezone(
+        &self,
+        bar_seconds: impl FnOnce() -> i64,
+    ) -> crate::scales::TimezoneMode {
+        let zone = self.display_timezone();
+        let wall = |bar: &crate::model::Bar| match &zone {
+            crate::scales::TimezoneMode::Local => crate::model::local_time(chrono::Local, bar.time),
+            zone => crate::model::local_time(zone.to_tz().unwrap_or_default(), bar.time),
+        };
+        let bars = (self.replay.as_ref())
+            .and_then(|replay| replay.bars.get(&super::SeriesId::MAIN))
+            .unwrap_or(&self.state.data().bars);
+        let edges = || bars.first().into_iter().chain(bars.last());
+        let utc_dates = self.feed_link.is_none()
+            && !self
+                .timeframe
+                .is_some_and(crate::model::Timeframe::is_trade_based)
+            && bar_seconds() >= 86_400
+            && edges().any(|bar| wall(bar) < bar.time.naive_utc())
+            && !edges().all(|bar| wall(bar).time() == chrono::NaiveTime::MIN);
+        if utc_dates {
+            crate::scales::TimezoneMode::Utc
+        } else {
+            self.display_timezone()
+        }
+    }
+
+    /// Dates and the axis marks read in [`label_timezone`](Self::label_timezone).
     pub(crate) fn build_time_formatter(&self) -> Box<dyn crate::scales::TimeFormatter> {
+        self.time_formatter_in(self.label_timezone(|| self.time_label_seconds()))
+    }
+
+    /// Formats in `timezone`, for instants with a clock such as fills, on any interval.
+    pub(crate) fn time_formatter_in(
+        &self,
+        timezone: crate::scales::TimezoneMode,
+    ) -> Box<dyn crate::scales::TimeFormatter> {
         let mut builder = TimeFormatterBuilder::new()
             .with_24_hour(true)
             .with_seconds(self.chart_options.time_scale.seconds_visible)
             .with_time_visible(self.chart_options.time_scale.time_visible)
-            .with_timezone(self.display_timezone());
+            .with_timezone(timezone);
         if let Some(locale) = &self.locale {
             builder = builder.with_locale(locale.clone());
         }
@@ -211,8 +258,9 @@ impl Chart {
     /// [`TickMarkContext`](crate::scales::TickMarkContext) and can return `None` to use the
     /// built-in locale-aware text for that tick. Otherwise the
     /// formatter replaces the built-in one, the locale and the date format. It receives
-    /// wall-clock times in the chart's time zone, and the time scale's
-    /// [`time_visible`](crate::config::TimeScaleOptions::time_visible) option still applies.
+    /// wall-clock times in the zone [`format_time`](Self::format_time) reads them in, and the
+    /// time scale's [`time_visible`](crate::config::TimeScaleOptions::time_visible) option
+    /// still applies.
     /// `None` restores the built-in formatter.
     ///
     /// [`TimeFormatter::format`]: crate::scales::TimeFormatter::format
@@ -823,6 +871,181 @@ mod tests {
                     labels >= 5,
                     "OHLC tooltip values must use the host formatter: {labels}"
                 );
+            }
+        }
+    }
+
+    /// Bars supplied at 00:00 UTC on their trading date keep that date in every display zone,
+    /// in the readout and in the day, month and year marks of the axis; intraday bars keep the
+    /// clock of the display zone.
+    #[cfg(feature = "timezones")]
+    #[test]
+    fn supplied_calendar_bars_keep_their_date_in_every_display_zone() {
+        use crate::model::{Bar, BarData, LogicalRange, Timeframe};
+        use crate::scales::TimezoneMode;
+        use chrono::{Datelike, Duration, Months, NaiveDate, TimeZone, Utc};
+        let day = |y, m, d| Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap();
+        let months = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        // (interval, first bar, bar read, its label, marks that must be painted)
+        for (timeframe, first, at, expected, required) in [
+            (
+                Timeframe::Day1,
+                day(2024, 1, 1),
+                95,
+                "Apr 05, 2024",
+                &["Feb", "Mar", "Apr"][..],
+            ),
+            (
+                Timeframe::Week1,
+                day(2023, 1, 2),
+                95,
+                "Oct 28, 2024",
+                &["2024"][..],
+            ),
+            (
+                Timeframe::Month1,
+                day(2016, 1, 1),
+                95,
+                "Dec 01, 2023",
+                &["2020"][..],
+            ),
+        ] {
+            let times: Vec<_> = (0..100)
+                .map(|i| match timeframe {
+                    Timeframe::Month1 => first.checked_add_months(Months::new(i)).unwrap(),
+                    Timeframe::Week1 => first + Duration::weeks(i.into()),
+                    _ => first + Duration::days(i.into()),
+                })
+                .collect();
+            for zone in [
+                TimezoneMode::Utc,
+                TimezoneMode::Timezone("America/New_York".parse().unwrap()),
+                TimezoneMode::Timezone("Asia/Tokyo".parse().unwrap()),
+            ] {
+                let ctx = egui::Context::default();
+                let bars = times
+                    .iter()
+                    .map(|&time| Bar::new(time, 100.0, 110.0, 100.0, 110.0, 1.0))
+                    .collect();
+                let mut chart = crate::widget::Chart::new(BarData::from_bars(bars));
+                chart.set_timeframe(timeframe);
+                chart.chart_options.time_scale.timezone = zone.clone();
+                frame(&ctx, &mut chart, 0.0, vec![]);
+                assert!(chart.set_visible_logical_range(LogicalRange::new(-0.5, 99.5)));
+                assert_eq!(
+                    chart.format_time(times[at]),
+                    expected,
+                    "{timeframe:?} {zone:?}"
+                );
+                let painted = shapes(&ctx, &mut chart, 0.1, vec![]);
+                let map = chart.get_chart_mapping();
+                let mut seen = Vec::new();
+                for text in painted.iter().filter_map(|shape| match shape {
+                    Shape::Text(text) if text.pos.y > map.rect.bottom() => Some(text),
+                    _ => None,
+                }) {
+                    let label = text.galley.text();
+                    let index = map.x_to_idx(text.pos.x + text.galley.size().x / 2.0);
+                    let date = times[index].date_naive();
+                    let starts_month =
+                        index == 0 || times[index - 1].date_naive().month() != date.month();
+                    let fits = match label.parse::<i32>() {
+                        Ok(year) if year > 31 => {
+                            starts_month && date.month() == 1 && date.year() == year
+                        }
+                        Ok(day) => date.day() as i32 == day,
+                        Err(_) => {
+                            starts_month
+                                && months.iter().position(|name| *name == label)
+                                    == Some(date.month0() as usize)
+                        }
+                    };
+                    assert!(fits, "{timeframe:?} {zone:?}: {label} on {date}");
+                    seen.push(label.to_owned());
+                }
+                for label in required {
+                    assert!(
+                        seen.iter().any(|seen| seen == label),
+                        "{timeframe:?} {zone:?}: {label} missing from {seen:?}"
+                    );
+                }
+            }
+        }
+        // Hourly bars keep the New York clock and date.
+        let first = NaiveDate::from_ymd_opt(2024, 1, 5)
+            .unwrap()
+            .and_hms_opt(3, 0, 0)
+            .unwrap()
+            .and_utc();
+        let bars = (0..100)
+            .map(|i| Bar::new(first + Duration::hours(i), 100.0, 110.0, 100.0, 110.0, 1.0))
+            .collect();
+        let mut chart = crate::widget::Chart::new(BarData::from_bars(bars));
+        chart.set_timeframe(Timeframe::Hour1);
+        chart.chart_options.time_scale.timezone = TimezoneMode::nyse();
+        assert_eq!(chart.format_time(first), "Thu 04 Jan '24 22:00");
+    }
+
+    /// Bar replay completes supplied daily bars, forms the bar of its cursor's date and lets
+    /// studies group weeks on the dates the labels give the bars: in the display zone east of
+    /// UTC, and in UTC behind it, where the history keeps its 00:00 UTC stamps.
+    #[cfg(feature = "timezones")]
+    #[test]
+    fn replay_follows_the_dates_of_supplied_daily_bars_in_every_zone() {
+        use crate::model::{Bar, BarClock, BarData, Timeframe};
+        use crate::scales::TimezoneMode;
+        use crate::widget::SeriesId;
+        use chrono::{Duration, TimeZone, Utc};
+        let bar = |time| Bar::new(time, 100.0, 110.0, 100.0, 110.0, 1.0);
+        let at = |month, day, hour| Utc.with_ymd_and_hms(2024, month, day, hour, 0, 0).unwrap();
+        // The zone, a cursor on 5 February and the zone's midnight starting that date.
+        for (zone, cursor, midnight) in [
+            ("Asia/Tokyo", at(2, 5, 12), at(2, 4, 15)),
+            ("America/New_York", at(2, 5, 17), at(2, 5, 5)),
+        ] {
+            let mut chart = crate::widget::Chart::new(BarData::from_bars(
+                (0..40)
+                    .map(|i| bar(at(1, 1, 0) + Duration::days(i)))
+                    .collect(),
+            ));
+            chart.set_timeframe(Timeframe::Day1);
+            chart.chart_options.time_scale.timezone = TimezoneMode::Timezone(zone.parse().unwrap());
+            #[cfg(feature = "studies")]
+            chart.add_indicator(Box::<crate::studies::HigherIntervalCandles>::default());
+            // 1 January completes when its date ends, also after a cursor that showed no bar.
+            chart.set_replay_time(Some(at(1, 1, 12)));
+            chart.set_replay_time(Some(at(1, 2, 6)));
+            let early = chart.bars(SeriesId::MAIN).len();
+            chart.set_replay_time(Some(cursor));
+            let hours = (0..24)
+                .map(|i| bar(midnight + Duration::hours(i)))
+                .collect();
+            assert!(
+                chart.set_replay_source(hours, BarClock::new(Timeframe::Hour1)),
+                "{zone}"
+            );
+            let bars = chart.bars(SeriesId::MAIN);
+            let labels: Vec<_> = (bars[bars.len() - 2..].iter())
+                .map(|bar| chart.format_time(bar.time))
+                .collect();
+            assert_eq!(
+                (early, bars.len(), labels),
+                (
+                    1,
+                    36,
+                    vec!["Feb 04, 2024".to_owned(), "Feb 05, 2024".to_owned()]
+                ),
+                "{zone}"
+            );
+            #[cfg(feature = "studies")]
+            {
+                chart.refresh_studies(1.0);
+                let study = chart.indicators().next().unwrap().1;
+                // The Mondays from 1 January; the last is the bar replay forms.
+                let starts: Vec<_> = (study.candles().iter()).map(|c| c.bars.start).collect();
+                assert_eq!(starts, [0, 7, 14, 21, 28, 35], "{zone}");
             }
         }
     }

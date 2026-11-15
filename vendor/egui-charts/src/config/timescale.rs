@@ -10,6 +10,7 @@ use egui::Color32;
 /// Time Scale Options.
 /// Controls bar spacing, scrolling constraints, and time display.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct TimeScaleOptions {
     /// The margin space in bars from the right side of the chart, kept
     /// whenever the view returns to the live edge.
@@ -117,7 +118,8 @@ pub struct TimeScaleOptions {
     /// Default: None
     pub border_color: Option<Color32>,
 
-    /// Timezone mode for displaying ts
+    /// Timezone mode for displaying ts. Behind UTC, bars of a day or longer given without a feed
+    /// read their date in UTC unless they sit at this zone's midnight.
     /// Default: UTC
     pub timezone: TimezoneMode,
 }
