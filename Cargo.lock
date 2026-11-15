@@ -990,6 +990,7 @@ dependencies = [
  "egui-charts",
  "egui_extras",
  "iana-time-zone",
+ "png 0.17.16",
  "serde_json",
 ]
 
@@ -4068,7 +4069,7 @@ dependencies = [
 
 [[package]]
 name = "tradecraft"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "tradecraft-ui-egui",
  "winresource",
@@ -4076,7 +4077,7 @@ dependencies = [
 
 [[package]]
 name = "tradecraft-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4085,7 +4086,7 @@ dependencies = [
 
 [[package]]
 name = "tradecraft-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4098,7 +4099,7 @@ dependencies = [
 
 [[package]]
 name = "tradecraft-providers"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4115,7 +4116,7 @@ dependencies = [
 
 [[package]]
 name = "tradecraft-ui-egui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -5135,7 +5136,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde_json",
 ]

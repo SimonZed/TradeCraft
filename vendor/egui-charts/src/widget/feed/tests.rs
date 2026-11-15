@@ -817,7 +817,9 @@ fn an_eviction_drops_the_scroll_back_page_in_flight_and_its_continuation() {
         assert_eq!(feed.pages.lock().unwrap().len(), 1, "{name}: in flight");
         feed.calls();
         match name {
-            "lowered limit" => chart.set_bar_limit(SeriesId::MAIN, NonZeroUsize::new(16)),
+            "lowered limit" => {
+                chart.set_bar_limit(SeriesId::MAIN, NonZeroUsize::new(16));
+            }
             "live bars" => {
                 let sink = feed.sink();
                 for minute in 23..27 {
@@ -1379,6 +1381,138 @@ fn paged_trades_without_history_leave_their_first_bar_incomplete() {
     assert_eq!(flow.complete_from(), Some(start + TimeDelta::seconds(2)));
 }
 
+/// Hand counts on 2t at price 100, executions of 1 without ids. A trade page answered in the drain
+/// that streams the first executions holds a sell at 0 s, traded before the subscription, and its
+/// copy of the stream's first buy; the stream buys twice at 0 s, then at 1 s and 2 s. The sink's
+/// bars are the two buys at 0 s and those at 1 s and 2 s, each bid 0 and ask 2: the sell is in
+/// neither. A footprint turned on after that drain, and again after it is turned off, shows both
+/// bars as the sink allocated them. The footprint a bar replay builds for profile drawings, with
+/// its cutoff after the last execution, shows the 0 s bar that way or without cells, never with
+/// the sell.
+#[test]
+fn footprint_turned_on_later_counts_the_stream_at_the_first_instant() {
+    use crate::model::OrderSide::{Buy, Sell};
+    let feed = Arc::new(Script::default());
+    let mut chart = fed(&feed, Some("A"));
+    chart.set_timeframe("2t".parse().unwrap());
+    let mut frames = Frames::new();
+    frames.run(&mut chart);
+    feed.resolve()
+        .send(Ok(Instrument::new("A").with_tick_size(1.0)));
+    feed.page().send(page(Vec::new(), true));
+    frames.run(&mut chart);
+    let start = bars(1)[0].time;
+    let fill =
+        |second: i64, side| Tick::new(start + TimeDelta::seconds(second), 100.0, 1.0, Some(side));
+    // The chart applies the page before the executions it drains with.
+    (feed.trades.lock().unwrap().remove(0))
+        .send(Ok(TradePage::new(vec![fill(0, Sell), fill(0, Buy)], false)));
+    let sink = feed.sink();
+    for second in [0, 0, 1, 2] {
+        sink.push_tick(fill(second, Buy));
+    }
+    frames.run(&mut chart);
+    let opens = [start, start + TimeDelta::seconds(1)];
+    // The bid and ask of each bar drawn with cells; `None` draws a candle.
+    let cells = |flow: &Footprint| {
+        let complete = flow.complete_from();
+        (opens.iter())
+            .map(|open| {
+                flow.bar_at(*open)
+                    .filter(|_| complete.is_some_and(|from| *open >= from))
+                    .map(|bar| (bar.bid, bar.ask))
+            })
+            .collect::<Vec<_>>()
+    };
+    for turned in ["on", "on again"] {
+        chart.set_chart_type(ChartType::VolumeFootprint);
+        for _ in 0..4 {
+            frames.run(&mut chart);
+        }
+        let drawn: Vec<_> = (chart.bars(SeriesId::MAIN).iter())
+            .map(|bar| bar.time)
+            .collect();
+        assert_eq!(drawn, opens, "turned {turned}");
+        let flow = (chart.feed_link.as_ref().unwrap().footprint.as_ref()).unwrap();
+        assert_eq!(cells(flow), [Some((0.0, 2.0)); 2], "turned {turned}");
+        chart.set_chart_type(ChartType::Candles);
+        frames.run(&mut chart);
+    }
+    let link = chart.feed_link.as_ref().unwrap();
+    let cutoff = start + TimeDelta::seconds(3);
+    let replay = link.footprint(Some(cutoff), chart.bars(SeriesId::MAIN));
+    let replayed = cells(&replay.unwrap());
+    assert_eq!(replayed[1], Some((0.0, 2.0)), "replay");
+    assert!(
+        replayed[0].is_none() || replayed[0] == Some((0.0, 2.0)),
+        "replay {:?}",
+        replayed[0]
+    );
+}
+
+/// Hand counts on 2t, executions of 1 without ids, the page applied as in the test above. The page
+/// holds copies of the stream's buys at 0 s and 1 s and a sell at 0.5 s that the stream sends after
+/// the buy at 1 s, so the sink leaves it out as late; the stream goes on with a buy at 2 s, a sell
+/// and a buy at 3 s, and buys at 4 s and 5 s, all at 100. The sink's bars open at 0 s (bid 0, ask
+/// 2), 1 s (0, 2), 3 s (1, 1) and 4 s (0, 2). A footprint turned on afterwards never counts the
+/// sell, whether it is at 99 or at 100: the 0 s bar shows its cells or none, and the later bars
+/// show theirs.
+#[test]
+fn footprint_turned_on_later_leaves_out_a_paged_execution_the_sink_dropped() {
+    use crate::model::OrderSide::{Buy, Sell};
+    let start = bars(1)[0].time;
+    let fill =
+        |ms, price, side| Tick::new(start + TimeDelta::milliseconds(ms), price, 1.0, Some(side));
+    let buy = |ms| fill(ms, 100.0, Buy);
+    let opens = [0, 1000, 3000, 4000].map(|ms| start + TimeDelta::milliseconds(ms));
+    for price in [99.0, 100.0] {
+        let feed = Arc::new(Script::default());
+        let mut chart = fed(&feed, Some("A"));
+        chart.set_timeframe("2t".parse().unwrap());
+        let mut frames = Frames::new();
+        frames.run(&mut chart);
+        feed.resolve()
+            .send(Ok(Instrument::new("A").with_tick_size(1.0)));
+        feed.page().send(page(Vec::new(), true));
+        frames.run(&mut chart);
+        let late = fill(500, price, Sell);
+        let paged = vec![buy(0), buy(0), late.clone(), buy(1000)];
+        (feed.trades.lock().unwrap().remove(0)).send(Ok(TradePage::new(paged, false)));
+        let sink = feed.sink();
+        let sell = fill(3000, 100.0, Sell);
+        for trade in [buy(0), buy(0), buy(1000), late, buy(2000), sell, buy(3000)] {
+            sink.push_tick(trade);
+        }
+        for ms in [4000, 5000] {
+            sink.push_tick(buy(ms));
+        }
+        frames.run(&mut chart);
+        chart.set_chart_type(ChartType::VolumeFootprint);
+        for _ in 0..4 {
+            frames.run(&mut chart);
+        }
+        let drawn: Vec<_> = (chart.bars(SeriesId::MAIN).iter())
+            .map(|bar| bar.time)
+            .collect();
+        assert_eq!(drawn, opens, "sell at {price}");
+        let flow = (chart.feed_link.as_ref().unwrap().footprint.as_ref()).unwrap();
+        let complete = flow.complete_from();
+        let cells: Vec<_> = (opens.iter())
+            .map(|open| {
+                flow.bar_at(*open)
+                    .filter(|_| complete.is_some_and(|from| *open >= from))
+                    .map(|bar| (bar.bid, bar.ask))
+            })
+            .collect();
+        assert!(
+            cells[0].is_none_or(|cell| cell == (0.0, 2.0)),
+            "sell at {price}: {cells:?}"
+        );
+        let later = [Some((0.0, 2.0)), Some((1.0, 1.0)), Some((0.0, 2.0))];
+        assert_eq!(cells[1..], later, "sell at {price}");
+    }
+}
+
 /// Hand counts on two-trade bars of buys at 100, one a second: 1 and 2 (volume 3), 3 and 4 (7),
 /// 5 and 6 (11), and the live 7 and 8 (15). A store of seven leaves out the buy of 1 in both
 /// orders, and a store of six the buys of 1 and 2, so that the oldest held execution opens the
@@ -1657,7 +1791,10 @@ fn restored_order_flow_study_keeps_the_chart_bars() {
 /// buys of 1 to 8, which leaves no live execution in the first two bars, or for the buys of 1 to
 /// 4 on a chart limited to two bars, which keeps the 2 s and 4 s bars while the study's source
 /// keeps the 0 s one. The replay cutoff at 3 s is exclusive and falls in the 2 s bar, before
-/// which only the buy of 4 came.
+/// which only the buy of 4 came. With the buys of 1, 2 and 4 at 0 s, 8 at 1 s and 16 at 2 s, the
+/// bars are 1 and 2 at 0 s, 4 and 8 (12) at 0 s + 1 ns, opened a nanosecond after it, and 16 at
+/// 2 s; a page of the three at 0 s on a chart limited to two bars drops the 0 s bar the source
+/// keeps, and the cutoff at 0.5 s falls in the 0 s + 1 ns bar, before which only the buy of 4 came.
 #[cfg(feature = "studies")]
 #[test]
 fn replay_after_a_trade_page_repeats_a_live_execution_stops_at_the_cutoff() {
@@ -1665,22 +1802,23 @@ fn replay_after_a_trade_page_repeats_a_live_execution_stops_at_the_cutoff() {
     use crate::studies::OrderFlowStudy;
     use std::num::NonZeroUsize;
     let start = bars(1)[0].time;
-    let tape: Vec<_> = [1.0, 2.0, 4.0, 8.0, 16.0]
-        .iter()
-        .enumerate()
-        .map(|(second, size)| {
-            let at = start + TimeDelta::seconds(second as i64);
-            Tick::new(at, 100.0, *size, Some(Buy))
-        })
-        .collect();
-    // The executions the page holds, the bar limit (none for 0), and the deltas before and during
-    // the replay.
-    let rows: [(usize, usize, &[f64], &[f64]); 3] = [
-        (1, 0, &[3.0, 12.0, 16.0], &[3.0, 4.0]),
-        (4, 0, &[3.0, 12.0, 16.0], &[3.0, 4.0]),
-        (3, 2, &[12.0, 16.0], &[4.0]),
+    let apart = [0, 1000, 2000, 3000, 4000];
+    // The buys' times and the replay cutoff in milliseconds, the executions the page holds, the
+    // bar limit (none for 0), and the deltas before and during the replay.
+    type Row = ([i64; 5], i64, usize, usize, &'static [f64], &'static [f64]);
+    let rows: [Row; 4] = [
+        (apart, 3000, 1, 0, &[3.0, 12.0, 16.0], &[3.0, 4.0]),
+        (apart, 3000, 4, 0, &[3.0, 12.0, 16.0], &[3.0, 4.0]),
+        (apart, 3000, 3, 2, &[12.0, 16.0], &[4.0]),
+        ([0, 0, 0, 1000, 2000], 500, 3, 2, &[12.0, 16.0], &[4.0]),
     ];
-    for (paged, limit, live, replayed) in rows {
+    for (times, cutoff, paged, limit, live, replayed) in rows {
+        let tape: Vec<_> = (times.iter().zip([1.0, 2.0, 4.0, 8.0, 16.0]))
+            .map(|(at, size)| {
+                let at = start + TimeDelta::milliseconds(*at);
+                Tick::new(at, 100.0, size, Some(Buy))
+            })
+            .collect();
         let feed = Arc::new(Script::default());
         let mut chart = fed(&feed, Some("A"));
         chart.set_timeframe("2t".parse().unwrap());
@@ -1703,12 +1841,20 @@ fn replay_after_a_trade_page_repeats_a_live_execution_stops_at_the_cutoff() {
             let study = chart.indicators().next().unwrap().1;
             study.values().line(0).to_vec()
         };
-        assert_eq!(deltas(&mut chart), live, "{paged} paged");
+        assert_eq!(deltas(&mut chart), live, "{paged} paged, cutoff {cutoff}");
         chart.set_feed_paused(true);
-        chart.set_replay_time(Some(start + TimeDelta::seconds(3)));
-        assert_eq!(deltas(&mut chart), replayed, "{paged} paged, replay");
+        chart.set_replay_time(Some(start + TimeDelta::milliseconds(cutoff)));
+        assert_eq!(
+            deltas(&mut chart),
+            replayed,
+            "{paged} paged, cutoff {cutoff}, replay"
+        );
         chart.set_replay_time(None);
-        assert_eq!(deltas(&mut chart), live, "{paged} paged, left");
+        assert_eq!(
+            deltas(&mut chart),
+            live,
+            "{paged} paged, cutoff {cutoff}, left"
+        );
     }
 }
 
@@ -2169,59 +2315,195 @@ fn an_interval_change_page_fills_the_retained_tape() {
 /// Counting the buy of 2 whole instead matches every bar's prices and volume and gives the bars
 /// at 00:00:01, 00:00:03 and 00:00:05 part of their neighbours' fills, as (level, bid, ask):
 /// (101, 0, 2), (102, 5, 0), (103, 3, 0); (103, 3, 0), (104, 0, 5), (105, 0, 2); and
-/// (105, 0, 4), (106, 6, 0).
+/// (105, 0, 4), (106, 6, 0). That grouping ends with the retained executions at 00:00:06, which
+/// lack the sell of 4, so their end proves nothing either while the trade page is outstanding or
+/// after a feed without trade history fails it.
+///
+/// Nor does it on a tick interval, where a bar in the history page opens between the two streams.
+/// Executions of 1 at 100: two buys at 00:00:00, a sell and then a buy at 00:00:01, and a buy each
+/// second through 00:00:06. The 3 tick bars open at 00:00:00, at 00:00:01 with the buy, and at
+/// 00:00:04. The 2 tick stream delivers the two executions at 00:00:01 and the buy at 00:00:02,
+/// and the 3 tick stream opens at 00:00:09. Grouped from the sell, the three retained executions
+/// match the prices and volume of the bar at 00:00:01 and end there, as (100, 1, 2). The bar's own
+/// are (100, 0, 3), its buy at 00:00:03 is not held, and it draws a candle.
+///
+/// What a second bar proves stays drawn meanwhile, and a trade page that adds nothing proves the
+/// rest. Buys of 1 at 100: nine a second apart from 00:00:01 and three at 00:00:10, all delivered
+/// by the 2 tick stream. The 3 tick bars open at 00:00:01, 00:00:04, 00:00:07 and 00:00:10, and
+/// the 3 tick stream opens at 00:00:12. While the trade page is outstanding the bars at 00:00:01,
+/// 00:00:04 and 00:00:07 draw their own (100, 0, 3), each proven by the bar that opens after it,
+/// also at the instant the retained executions end, and the bar at 00:00:10, which only their end
+/// could prove, draws a candle. The trade page then repeats the retained executions: nothing
+/// traded between the two streams, their end is the page's, and the bar at 00:00:10 draws its
+/// (100, 0, 3) as well.
 #[test]
 fn an_interval_change_page_draws_only_a_bars_own_executions() {
-    use crate::model::OrderSide::{Buy, Sell};
+    use crate::model::OrderSide::{self, Buy, Sell};
     let start = bars(1)[0].time;
-    let fills = [
-        (100.0, 9.0, Buy),
-        (101.0, 2.0, Buy),
-        (102.0, 5.0, Sell),
-        (103.0, 6.0, Sell),
-        (104.0, 5.0, Buy),
-        (105.0, 6.0, Buy),
-        (106.0, 6.0, Sell),
-        (106.0, 4.0, Sell),
-    ];
-    let rows: [(&str, bool, bool, &[f64]); 3] = [
+    type Fill = (i64, f64, f64, OrderSide);
+    // The intervals before and after the change, the executions by second, those the first
+    // stream delivers, the first of the second stream, and the bars of the history page.
+    type Tape<'a> = (
+        [&'a str; 2],
+        &'a [Fill],
+        std::ops::Range<usize>,
+        Fill,
+        usize,
+    );
+    let volume: Tape = (
+        ["20v", "10v"],
+        &[
+            (0, 100.0, 9.0, Buy),
+            (1, 101.0, 2.0, Buy),
+            (2, 102.0, 5.0, Sell),
+            (3, 103.0, 6.0, Sell),
+            (4, 104.0, 5.0, Buy),
+            (5, 105.0, 6.0, Buy),
+            (6, 106.0, 6.0, Sell),
+            (7, 106.0, 4.0, Sell),
+        ],
+        1..7,
+        (7, 106.0, 1.0, Sell),
+        4,
+    );
+    let ticks: Tape = (
+        ["2t", "3t"],
+        &[
+            (0, 100.0, 1.0, Buy),
+            (0, 100.0, 1.0, Buy),
+            (1, 100.0, 1.0, Sell),
+            (1, 100.0, 1.0, Buy),
+            (2, 100.0, 1.0, Buy),
+            (3, 100.0, 1.0, Buy),
+            (4, 100.0, 1.0, Buy),
+            (5, 100.0, 1.0, Buy),
+            (6, 100.0, 1.0, Buy),
+        ],
+        2..5,
+        (9, 100.0, 1.0, Buy),
+        3,
+    );
+    let quiet: Tape = (
+        ["2t", "3t"],
+        &[
+            (1, 100.0, 1.0, Buy),
+            (2, 100.0, 1.0, Buy),
+            (3, 100.0, 1.0, Buy),
+            (4, 100.0, 1.0, Buy),
+            (5, 100.0, 1.0, Buy),
+            (6, 100.0, 1.0, Buy),
+            (7, 100.0, 1.0, Buy),
+            (8, 100.0, 1.0, Buy),
+            (9, 100.0, 1.0, Buy),
+            (10, 100.0, 1.0, Buy),
+            (10, 100.0, 1.0, Buy),
+            (10, 100.0, 1.0, Buy),
+        ],
+        0..12,
+        (12, 100.0, 1.0, Buy),
+        4,
+    );
+    enum Answer {
+        Bars,
+        Executions,
+        NoExecutions,
+    }
+    use Answer::{Bars, Executions, NoExecutions};
+    // The cells of the bars drawn, as (level, bid, ask).
+    type Drawn<'a> = &'a [&'a [(i64, f64, f64)]];
+    let buys: &[(i64, f64, f64)] = &[(100, 0.0, 3.0)];
+    // The answers in order; the held executions and the bars drawn are checked after each one
+    // from the history page on.
+    type Row<'a> = (
+        &'a str,
+        bool,
+        &'a Tape<'a>,
+        [Answer; 2],
+        &'a [f64],
+        [Drawn<'a>; 2],
+    );
+    let rows: [Row; 7] = [
         (
             "ids",
             true,
-            false,
+            &volume,
+            [Executions, Bars],
             &[2.0, 5.0, 6.0, 5.0, 6.0, 6.0, 4.0, 1.0],
+            [&[], &[]],
         ),
-        ("no ids", false, false, &[2.0, 5.0, 6.0, 5.0, 6.0, 6.0, 1.0]),
+        (
+            "no ids",
+            false,
+            &volume,
+            [Executions, Bars],
+            &[2.0, 5.0, 6.0, 5.0, 6.0, 6.0, 1.0],
+            [&[], &[]],
+        ),
         (
             "no ids, history page first",
             false,
-            true,
+            &volume,
+            [Bars, Executions],
             &[2.0, 5.0, 6.0, 5.0, 6.0, 6.0, 1.0],
+            [&[], &[]],
+        ),
+        (
+            "ids, no trade history",
+            true,
+            &volume,
+            [Bars, NoExecutions],
+            &[2.0, 5.0, 6.0, 5.0, 6.0, 6.0, 1.0],
+            [&[], &[]],
+        ),
+        (
+            "no ids, no trade history",
+            false,
+            &volume,
+            [Bars, NoExecutions],
+            &[2.0, 5.0, 6.0, 5.0, 6.0, 6.0, 1.0],
+            [&[], &[]],
+        ),
+        (
+            "ticks, a bar opens between the streams, no trade history",
+            false,
+            &ticks,
+            [Bars, NoExecutions],
+            &[1.0, 1.0, 1.0, 1.0],
+            [&[], &[]],
+        ),
+        (
+            "ticks, nothing traded between the streams, a trade page that adds nothing",
+            true,
+            &quiet,
+            [Bars, Executions],
+            &[1.0; 13],
+            [&[buys, buys, buys], &[buys, buys, buys, buys]],
         ),
     ];
     let mut failures = Vec::new();
-    for (label, ids, history_first, held) in rows {
-        let identified = |trade: Tick, id| if ids { trade.with_id(id) } else { trade };
-        let tape: Vec<Tick> = (fills.iter().enumerate())
-            .map(|(second, &(price, size, side))| {
-                let at = start + TimeDelta::seconds(second as i64);
-                identified(Tick::new(at, price, size, Some(side)), second as u64 + 1)
-            })
+    for (label, ids, (intervals, fills, streamed, live, paged), answers, held, cells) in rows {
+        let execution = |&(second, price, size, side): &Fill, id| {
+            let trade = Tick::new(start + TimeDelta::seconds(second), price, size, Some(side));
+            if ids { trade.with_id(id) } else { trade }
+        };
+        let tape: Vec<Tick> = (fills.iter().zip(1..))
+            .map(|(fill, id)| execution(fill, id))
             .collect();
-        let live = identified(Tick::new(tape[7].ts, 106.0, 1.0, Some(Sell)), 100);
-        let timeframe: Timeframe = "10v".parse().unwrap();
+        let live = execution(live, 100);
+        let paged = *paged;
+        let timeframe: Timeframe = intervals[1].parse().unwrap();
         let candles =
             crate::data::aggregate_trades_with_tick_size(&tape, timeframe, Some(1.0)).unwrap();
         let feed = Arc::new(Script::default());
         let mut chart = fed(&feed, Some("A"));
-        chart.set_timeframe("20v".parse().unwrap());
+        chart.set_timeframe(intervals[0].parse().unwrap());
         chart.set_chart_type(ChartType::VolumeFootprint);
         let mut frames = Frames::new();
         frames.run(&mut chart);
         feed.resolve()
             .send(Ok(Instrument::new("A").with_tick_size(1.0)));
         frames.run(&mut chart);
-        (tape[1..7].iter()).for_each(|trade| feed.sink().push_tick(trade.clone()));
+        (tape[streamed.clone()].iter()).for_each(|trade| feed.sink().push_tick(trade.clone()));
         frames.run(&mut chart);
         chart.set_timeframe(timeframe);
         frames.run(&mut chart);
@@ -2231,39 +2513,45 @@ fn an_interval_change_page_draws_only_a_bars_own_executions() {
         feed.sink().push_tick(live);
         frames.run(&mut chart);
         // Each subscription asked for its own pages; the newest are the new interval's.
-        let trades = feed.trades.lock().unwrap().pop().unwrap();
-        let history = feed.pages.lock().unwrap().pop().unwrap();
-        let trade_page = Ok(TradePage::new(tape[1..].to_vec(), false));
-        let history_page = page(candles[..4].to_vec(), true);
-        if history_first {
-            history.send(history_page);
+        let mut trades = feed.trades.lock().unwrap().pop();
+        let mut history = feed.pages.lock().unwrap().pop();
+        for (at, answer) in answers.into_iter().enumerate() {
+            match answer {
+                Bars => (history.take().unwrap()).send(page(candles[..paged].to_vec(), true)),
+                Executions => {
+                    (trades.take().unwrap()).send(Ok(TradePage::new(tape[1..].to_vec(), false)))
+                }
+                NoExecutions => trades.take().unwrap().send(Err(FeedError::NotSupported)),
+            }
             frames.run(&mut chart);
-            trades.send(trade_page);
-        } else {
-            trades.send(trade_page);
-            frames.run(&mut chart);
-            history.send(history_page);
-        }
-        frames.run(&mut chart);
-        assert_eq!(chart.bars(SeriesId::MAIN)[..4], candles[..4], "{label}");
-        let sizes: Vec<_> = (chart.trades(SeriesId::MAIN).map(|trade| trade.size)).collect();
-        if sizes != held {
-            failures.push(format!("{label}: held {sizes:?}"));
-        }
-        let link = chart.feed_link.as_ref().unwrap();
-        let flow = link.footprint.as_ref().unwrap();
-        let complete = flow.complete_from();
-        let drawn: Vec<Vec<_>> = (candles[..4].iter())
-            .filter(|bar| complete.is_some_and(|from| bar.time >= from))
-            .filter_map(|bar| flow.bar_at(bar.time))
-            .map(|cells| {
-                (cells.levels.values())
-                    .map(|level| (level.level, level.bid, level.ask))
-                    .collect()
-            })
-            .collect();
-        if !drawn.is_empty() {
-            failures.push(format!("{label}: drawn {drawn:?}"));
+            if history.is_some() {
+                continue;
+            }
+            let label = format!("{label}, after answer {at}");
+            assert_eq!(
+                chart.bars(SeriesId::MAIN)[..paged],
+                candles[..paged],
+                "{label}"
+            );
+            let sizes: Vec<_> = (chart.trades(SeriesId::MAIN).map(|trade| trade.size)).collect();
+            if sizes != held {
+                failures.push(format!("{label}: held {sizes:?}"));
+            }
+            let link = chart.feed_link.as_ref().unwrap();
+            let flow = link.footprint.as_ref().unwrap();
+            let complete = flow.complete_from();
+            let drawn: Vec<Vec<_>> = (candles[..paged].iter())
+                .filter(|bar| complete.is_some_and(|from| bar.time >= from))
+                .filter_map(|bar| flow.bar_at(bar.time))
+                .map(|cells| {
+                    (cells.levels.values())
+                        .map(|level| (level.level, level.bid, level.ask))
+                        .collect()
+                })
+                .collect();
+            if drawn != cells[at] {
+                failures.push(format!("{label}: drawn {drawn:?}"));
+            }
         }
     }
     assert!(failures.is_empty(), "{failures:?}");
@@ -2481,6 +2769,66 @@ fn range_bars_are_built_from_the_held_trades() {
         closes,
         [[104.0, 100.0, 96.0, 100.0], [96.0, 100.0, 104.0, 100.0]]
     );
+}
+
+/// Trades that arrive after OHLC history keep the range bars approximated before the bar that
+/// holds the first trade, on either side of a replay cursor at that trade.
+#[test]
+fn range_bars_keep_the_approximated_history_before_the_first_trade() {
+    use crate::model::RangeBarSource::{OhlcApproximation, OhlcThenExecutions};
+    let feed = Arc::new(Script::default());
+    let mut chart = fed(&feed, Some("A"));
+    chart.set_chart_type(crate::model::ChartType::Range);
+    chart.set_chart_type_params(crate::model::ChartTypeParams {
+        range_size: 1.0,
+        ..Default::default()
+    });
+    let mut frames = Frames::new();
+    frames.run(&mut chart);
+    feed.resolve().send(Ok(Instrument::new("A")));
+    // Flat minute bars at 100 to 105: range bars closing at 101 to 105, then one at 105 in
+    // progress.
+    feed.page().send(page(bars(6), true));
+    frames.run(&mut chart);
+    let closes = |chart: &Chart| {
+        chart
+            .state
+            .shown()
+            .iter()
+            .map(|bar| bar.close)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(closes(&chart), [101.0, 102.0, 103.0, 104.0, 105.0, 105.0]);
+    let history = chart.state.shown()[..4].to_vec();
+    // Trades at 105 and 106 in the last bar's minute replace that bar: the bars before it give
+    // the range bars closing at 101 to 104, and the trades one from 105 to 106.
+    let minute = bars(6)[5].time;
+    let sink = feed.sink();
+    for (seconds, price) in [(10, 105.0), (20, 106.0)] {
+        sink.push_tick(Tick::new(
+            minute + TimeDelta::seconds(seconds),
+            price,
+            1.0,
+            None,
+        ));
+    }
+    frames.run(&mut chart);
+    assert_eq!(chart.range_bar_source(), Some(OhlcThenExecutions));
+    assert_eq!(closes(&chart), [101.0, 102.0, 103.0, 104.0, 106.0]);
+    assert_eq!(chart.state.shown()[..4], history);
+    // Replay keeps the five completed bars: their approximation before the first trade, the
+    // approximated range bars and that trade's range bar after it.
+    for (seconds, source, last) in [
+        (5, OhlcApproximation, 104.0),
+        (15, OhlcThenExecutions, 105.0),
+    ] {
+        chart.set_replay_time(Some(minute + TimeDelta::seconds(seconds)));
+        frames.run(&mut chart);
+        assert_eq!(chart.range_bar_source(), Some(source), "{seconds} s");
+        assert_eq!(chart.state.shown()[..4], history, "{seconds} s");
+        assert_eq!(chart.state.shown()[4].close, last, "{seconds} s");
+        assert_eq!(chart.state.shown().len(), 5, "{seconds} s");
+    }
 }
 
 #[test]

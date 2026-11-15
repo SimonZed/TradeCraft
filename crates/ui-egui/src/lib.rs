@@ -12,6 +12,7 @@
 )]
 
 mod terminal_app;
+mod options_view;
 mod pine_engine;
 mod pine_editor;
 mod terminal_feed;
@@ -57,11 +58,11 @@ impl TimeFormatter for ChartTimeFormatter {
 
 impl ChartTimeFormatter {
     fn default_formatter(&self) -> DefaultTimeFormatter {
-        DefaultTimeFormatter {
-            use_24_hour: false,
-            show_seconds: false,
-            date_format: None,
-        }
+        let mut formatter = DefaultTimeFormatter::default();
+        formatter.use_24_hour = false;
+        formatter.show_seconds = false;
+        formatter.date_format = None;
+        formatter
     }
 }
 

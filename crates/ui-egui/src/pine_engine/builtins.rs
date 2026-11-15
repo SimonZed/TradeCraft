@@ -185,7 +185,6 @@ pub const TA_NAMES: &[&str] = &[
         "valuewhen",
         "pivothigh",
         "pivotlow",
-        "na",
         "rising",
         "falling",
         "mom",
@@ -843,7 +842,6 @@ fn ta_known(name: &str, state: &mut TaState, args: &[Value], bar: &Bar) -> Optio
             }
             num(state.window.iter().sum::<f64>() / volume)
         }
-        "na" => Some(Value::Bool(true)),
         "range" => {
             let src = args.first().and_then(number)?;
             let len = length(args.get(1), 1);

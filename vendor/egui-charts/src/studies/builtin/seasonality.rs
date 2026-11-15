@@ -118,7 +118,7 @@ impl Seasonality {
                 .map(String::from)
                 .to_vec(),
                 rows: Vec::new(),
-                ..StudyTable::default()
+                ..Default::default()
             },
             projection: Vec::new(),
             colors: [palette::UP, gray, gray, gray, gray],

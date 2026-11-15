@@ -1197,14 +1197,9 @@ mod tests {
                         .iter()
                         .any(|(label, _)| *label == display_long(custom))
                 );
-                let add = labels.iter().find(|(label, _)| label == "Add").unwrap().1;
-                assert_eq!(click(&mut restored, add), TimeframeAction::None);
-                assert!(restored.custom_dialog.error.is_some());
-                assert_eq!(restored.preferences(), saved);
-                restored.custom_dialog.unit = TimeframeUnit::Millisecond;
-                restored.custom_dialog.value_input = "1".to_owned();
-                assert_eq!(click(&mut restored, add), TimeframeAction::None);
-                assert!(restored.custom_dialog.error.is_some());
+                // TradeCraft hides custom entry when the feed supports only presets.
+                assert!(!labels.iter().any(|(label, _)| label == "Add"));
+                assert!(!restored.show_custom_input);
                 assert_eq!(restored.preferences(), saved);
                 restored.set_supported_timeframes(None);
                 let (_, labels, _) = frame(&mut restored, vec![]);

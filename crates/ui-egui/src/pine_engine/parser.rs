@@ -46,12 +46,14 @@ impl Parser {
         let mut overlay = true;
         let body = parser.parse_body(&mut title, &mut overlay)?;
         inputs_of(&body, &mut parser.inputs);
+        let indexed = crate::pine_engine::runtime::indexed_calls(&body);
         Ok(Program {
             title,
             overlay,
             body,
             inputs: parser.inputs,
             diagnostics: parser.diagnostics,
+            indexed,
         })
     }
 

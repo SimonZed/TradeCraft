@@ -124,8 +124,7 @@ impl Chart {
             .enumerate()
             .filter(|(_, pane)| {
                 pane.id == main_pane
-                    || (pane.id == PaneId::MAIN || self.pane_shown(pane))
-                        && maximized.is_none_or(|id| id == pane.id)
+                    || self.pane_drawn(pane) && maximized.is_none_or(|id| id == pane.id)
             })
             .map(|(idx, pane)| (idx, pane.id, false))
             .collect();
@@ -262,19 +261,26 @@ impl Chart {
             Pos2::new(plot.left(), available.bottom() - axis_height),
             Pos2::new(plot.right(), available.bottom()),
         );
-        // The price frame has no height for time navigation in these layouts.
-        let shared_plot =
-            (main_at.is_none() || main_collapsed || maximized.is_some_and(|id| id != main_pane))
-                .then(|| {
-                    ui.interact(
-                        Rect::from_min_max(
-                            Pos2::new(plot.left(), available.top()),
-                            Pos2::new(plot.right(), time_axis.top()),
-                        ),
-                        ui.scope_id().with((maximized, "plot")),
-                        Sense::click_and_drag(),
-                    )
-                });
+        // The plot of every row but the expanded price frame, made before that frame so that
+        // time navigation reads their drags, wheel and pinch with its own. A row's own response
+        // lies above its plot and keeps the clicks and the keyboard focus.
+        let pane_plots: Vec<_> = panes
+            .iter()
+            .zip(&rects)
+            .filter(|((_, id, collapsed), _)| *id != main_pane || *collapsed)
+            .map(|((_, id, _), rect)| {
+                let response = ui.interact(
+                    Rect::from_x_y_ranges(plot.x_range(), rect.y_range()),
+                    ui.scope_id().with((*id, "plot")),
+                    Sense::CLICK | Sense::DRAG,
+                );
+                (*id, response)
+            })
+            .collect();
+        let shared_plot = pane_plots
+            .iter()
+            .map(|(_, plot)| plot.clone())
+            .reduce(|plots, plot| plots.union(plot));
         let price_frame = if main_collapsed {
             Rect::from_min_size(main_rect.min, egui::vec2(main_rect.width(), 0.0))
         } else {
@@ -380,7 +386,10 @@ impl Chart {
         // A host series whose legend asked to remove it, hide it, or open its settings.
         let mut pending_series_action = None;
         let mut pending_pane_collapse = None;
-        let mut pending_pane_maximize = None;
+        // A chart without another pane has nothing to hide behind the price pane.
+        let mut pending_pane_maximize = (self.price_plot_double_click
+            && (maximized.is_some() || panes.len() > 1))
+            .then_some(main_pane);
         let current_selection = self.selection.selected_id();
         // Draws the background, grid, axis and crosshair of a pane without a visible study.
         let frame = CustomIndicator::new("", |_| Vec::new())
@@ -575,6 +584,12 @@ impl Chart {
                 config.show_grid &= Some(entry) == first;
                 let mut panel = IndicatorPane::with_config(config);
                 panel.legend_backdrop = self.config.indicator_backdrop_opacity;
+                panel.background = Some((
+                    self.background_frame(panel_rect),
+                    self.config.background_style,
+                    self.config.background_color,
+                ));
+                panel.text_color = Some(self.config.text_color);
                 panel.axis_options = crate::config::PriceAxisOptions {
                     show_study_values: self.config.price_axis.show_study_values,
                     ..self.config.price_axis
@@ -932,15 +947,11 @@ impl Chart {
                         menu,
                     } = interaction;
 
-                    let mut pane_response = match shared_plot.as_ref().filter(|_| {
-                        maximized.is_some()
-                            || ui
-                                .input(|input| input.pointer.interact_pos())
-                                .is_some_and(|pos| chart_rect.contains(pos))
-                    }) {
-                        Some(plot) => pane_response.union(plot.clone()),
-                        None => pane_response.interact(Sense::click_and_drag()),
-                    };
+                    // A drag belongs to the pane it began in, wherever the pointer goes.
+                    let mut pane_response = pane_plots
+                        .iter()
+                        .filter(|(id, _)| *id == pane_id)
+                        .fold(pane_response, |pane, (_, plot)| pane.union(plot.clone()));
                     if self.chart_options.tooltip.enabled
                         && self.chart_options.tooltip.on_long_press
                         && touch_readout.touch_input
@@ -1300,7 +1311,7 @@ impl Chart {
                                 item,
                                 self.series_map(item, chart_rect),
                                 index,
-                                |_| ui.active_theme().chart.bg,
+                                |point| self.background_at(panel_rect, point),
                             );
                         }
                     }
@@ -1431,7 +1442,10 @@ impl Chart {
                     let mut cursors = std::mem::take(&mut self.cursor_modes);
                     let timescale = self.state.time_scale().clone();
                     let painter = ui.painter().clone();
-                    let time_formatter = self.build_time_formatter();
+                    // Sampled once: inferred spacing sorts the gaps of the bars in view.
+                    let bar_seconds = self.time_label_seconds();
+                    let time_formatter =
+                        self.time_formatter_in(self.label_timezone(|| bar_seconds));
                     self.handle_pane_drawings(
                         ui,
                         &mut drawings,
@@ -1441,7 +1455,7 @@ impl Chart {
                         &drawing_map,
                         &painter,
                         &timescale,
-                        (time_formatter.as_ref(), self.time_label_seconds()),
+                        (time_formatter.as_ref(), bar_seconds),
                         Some(pane_id),
                     );
                     let drawing_hit = pane_response
@@ -1540,7 +1554,7 @@ impl Chart {
                 }
             }
             if !collapsed {
-                let mut table_rect = plot;
+                let mut table_rect = pane_plot;
                 for id in &members {
                     if let Some(idx) = self.study_ids.iter().position(|study| study == id) {
                         let study = &studies.indicators()[idx];
@@ -1628,7 +1642,10 @@ impl Chart {
         if main_collapsed {
             self.collapsed_price_header(ui, main_rect);
         }
-        self.pane_collapse_shortcut(ui);
+        // On a pane maximized when the frame began, the gesture was the plain double-click.
+        if maximized.is_none() {
+            self.pane_collapse_shortcut(ui);
+        }
 
         ui.advance_cursor_after_rect(available);
         ui.spacing_mut().item_spacing = host_spacing;

@@ -310,7 +310,7 @@ pub use market_breadth::{
 mod special_k;
 mod woodies_cci;
 pub use symbol_pair::{Correlation, Ratio, Spread, SymbolPair};
-pub use technical_ratings::TechnicalRatings;
+pub use technical_ratings::{RatingBasis, TechnicalRatings};
 // Time studies
 mod lower_interval;
 mod performance;
@@ -495,7 +495,7 @@ pub use ma_presets::{MARibbon, MixedMACross, TripleMA};
 pub use smoothed_ma::SmoothedMA;
 
 // Re-exports - Tenth batch (Statistics)
-pub use majority_rule::MajorityRule;
+pub use majority_rule::{MajorityMode, MajorityRule};
 pub use rank_correlation::RankCorrelationIndex;
 pub use standard_error::StandardError;
 pub use standard_error_bands::StandardErrorBands;

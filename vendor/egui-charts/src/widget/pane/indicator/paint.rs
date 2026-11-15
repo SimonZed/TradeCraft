@@ -244,7 +244,7 @@ impl IndicatorPane {
             if count == 0 {
                 return;
             }
-            let spacing = rect.width() / count as f32;
+            let spacing = (rect.width() - 1.0) / count as f32;
             let coords = IndicatorCoordParams::new(
                 spacing,
                 0.0,
@@ -267,7 +267,7 @@ impl IndicatorPane {
         if count == 0 {
             return;
         }
-        let spacing = rect.width() / count as f32;
+        let spacing = (rect.width() - 1.0) / count as f32;
         let coords = IndicatorCoordParams::new(
             spacing,
             0.0,
@@ -317,6 +317,7 @@ impl IndicatorPane {
         y_min: f64,
         y_max: f64,
         indicator: &dyn Indicator,
+        last_in_view: Option<usize>,
         axis: Option<crate::scales::PriceScaleId>,
         crosshair_tag: Option<Rect>,
     ) -> f32 {
@@ -342,7 +343,9 @@ impl IndicatorPane {
             },
             |axis| axis.right(),
         );
-        let text_color = painter.ctx().active_theme().chart.axis_text;
+        let text_color = self
+            .text_color
+            .unwrap_or_else(|| painter.ctx().active_theme().chart.axis_text);
         let map = self
             .price_map
             .unwrap_or_else(|| {
@@ -369,6 +372,7 @@ impl IndicatorPane {
                     label_rect,
                     &map,
                     indicator,
+                    last_in_view,
                     axis_edge,
                     &mut tags,
                     &self.axis_options,
@@ -379,6 +383,7 @@ impl IndicatorPane {
                     label_rect,
                     &map,
                     indicator,
+                    last_in_view,
                     axis_edge,
                     &mut tags,
                     None,
@@ -398,9 +403,9 @@ impl IndicatorPane {
                 self.price_formatter.as_deref(),
             )
         };
-        for tag in tags.iter().chain(&self.fixed_axis_tags).flatten() {
-            width = width.max(tag.width() + 5.0 + 6.0);
-        }
+        width = width.max(crate::chart::rendering::axes::axis_tags_width(
+            tags.iter().chain(&self.fixed_axis_tags),
+        ));
         self.axis_tags = tags.clone();
         tags.extend(self.fixed_axis_tags.iter().copied());
         if !self.draw_axis {
@@ -586,14 +591,13 @@ impl IndicatorPane {
             rect.left() + theme.spacing.sm,
             rect.top() + self.legend_offset + theme.spacing.sm.min(rect.height() / 2.0),
         );
+        let backdrop = Rect::from_min_size(pos, galley.size())
+            .expand(2.0)
+            .intersect(rect);
         painter.rect_filled(
-            Rect::from_min_size(pos, galley.size())
-                .expand(2.0)
-                .intersect(rect),
+            backdrop,
             0.0,
-            theme
-                .chart
-                .bg
+            self.background_at(painter.ctx(), backdrop.center())
                 .gamma_multiply(self.legend_backdrop.clamp(0.0, 1.0)),
         );
         painter.galley(pos, galley, text_color);
@@ -611,7 +615,10 @@ impl IndicatorPane {
             indicator,
             text_color,
             theme.ui.text_muted,
-            theme.chart.bg,
+            self.background_at(
+                painter.ctx(),
+                rect.min + egui::vec2(0.0, self.legend_offset),
+            ),
             theme.text.ohlc,
         );
         let controls_width = crate::chart::rendering::controls_width(indicator);
@@ -1005,6 +1012,7 @@ mod tests {
                         0.0,
                         3_000_000.0,
                         studies[0].as_ref(),
+                        Some(usize::MAX),
                         Some(crate::scales::PriceScaleId::Right),
                         None,
                     );
@@ -1190,6 +1198,8 @@ mod tests {
                                 rect,
                                 &Default::default(),
                                 None,
+                                egui::Color32::WHITE,
+                                &|_| egui::Color32::BLACK,
                             );
                         } else {
                             crate::chart::rendering::axes::render_study_tags(
@@ -1197,6 +1207,7 @@ mod tests {
                                 rect,
                                 &map,
                                 &study,
+                                Some(usize::MAX),
                                 450.0,
                                 &mut Vec::new(),
                                 None,

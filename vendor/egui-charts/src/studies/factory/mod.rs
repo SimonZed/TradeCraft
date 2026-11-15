@@ -66,9 +66,9 @@ macro_rules! register_builtins {
 /// or source range. Additional indicators can be registered at runtime with
 /// [`register`](Self::register).
 ///
-/// [`create`](Self::create) and [`has`](Self::has) also resolve the names of seven exported
+/// [`create`](Self::create) and [`has`](Self::has) also resolve the names of six exported
 /// studies the catalogue leaves out, so that a template, a copied study or a saved layout of
-/// one is recreated: `CVD`, `C2C Vol`, `HL2`, `HLC3`, `Price Channel`, `Ehlers Fisher` and
+/// one is recreated: `CVD`, `HL2`, `HLC3`, `Price Channel`, `Ehlers Fisher` and
 /// `MA Combination`, which creates [`MACombination::ribbon`] for its inputs to reshape. They have
 /// no category and are not in [`list`](Self::list) or [`count`](Self::count).
 pub struct IndicatorFactory {
@@ -77,6 +77,14 @@ pub struct IndicatorFactory {
     help_urls: HashMap<&'static str, &'static str>,
     defaults: HashMap<String, StudyTemplate>,
     saved_study_resolver: Option<Box<dyn Fn(&str) -> Option<Box<dyn Indicator>> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for IndicatorFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndicatorFactory")
+            .field("constructors", &self.constructors.keys())
+            .finish_non_exhaustive()
+    }
 }
 
 impl IndicatorFactory {
@@ -115,12 +123,11 @@ impl IndicatorFactory {
     /// listed study of the same name would replace them.
     fn register_builtin(&mut self) {
         // Exported studies outside the catalogue, resolved by name so that saved copies load.
-        register_builtins!(@help self, "struct", CVD, CloseToCloseVol, HL2, HLC3, PriceChannel, EhlersFisher, MACombination, OrderFlowStudy, ChartPatterns, OptionsVolumeProfile);
+        register_builtins!(@help self, "struct", CVD, HL2, HLC3, PriceChannel, EhlersFisher, MACombination, OrderFlowStudy, ChartPatterns, OptionsVolumeProfile);
         #[cfg(feature = "drawings")]
         register_builtins!(@help self, "struct", AutoDrawing);
-        let unlisted: [fn() -> Box<dyn Indicator>; 7] = [
+        let unlisted: [fn() -> Box<dyn Indicator>; 6] = [
             || Box::new(CVD::default()),
-            || Box::new(CloseToCloseVol::default()),
             || Box::new(HL2::default()),
             || Box::new(HLC3::default()),
             || Box::new(PriceChannel::default()),
@@ -240,6 +247,7 @@ impl IndicatorFactory {
                 DonchianChannels,
                 StandardDeviation,
                 HistoricalVolatility,
+                CloseToCloseVol,
                 ChaikinVolatility,
                 ChandelierExit,
                 AccelerationBands,

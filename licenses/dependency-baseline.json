@@ -908,23 +908,23 @@
       "license": "MIT",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
-    "tradecraft-core@0.3.0": {
+    "tradecraft-core@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft-engine@0.3.0": {
+    "tradecraft-engine@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft-providers@0.3.0": {
+    "tradecraft-providers@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft-ui-egui@0.3.0": {
+    "tradecraft-ui-egui@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft@0.3.0": {
+    "tradecraft@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
@@ -2010,23 +2010,23 @@
       "license": "MIT",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
-    "tradecraft-core@0.3.0": {
+    "tradecraft-core@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft-engine@0.3.0": {
+    "tradecraft-engine@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft-providers@0.3.0": {
+    "tradecraft-providers@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft-ui-egui@0.3.0": {
+    "tradecraft-ui-egui@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft@0.3.0": {
+    "tradecraft@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
@@ -3072,23 +3072,23 @@
       "license": "MIT",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
-    "tradecraft-core@0.3.0": {
+    "tradecraft-core@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft-engine@0.3.0": {
+    "tradecraft-engine@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft-providers@0.3.0": {
+    "tradecraft-providers@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft-ui-egui@0.3.0": {
+    "tradecraft-ui-egui@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft@0.3.0": {
+    "tradecraft@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
@@ -4186,23 +4186,23 @@
       "license": "MIT",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
-    "tradecraft-core@0.3.0": {
+    "tradecraft-core@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft-engine@0.3.0": {
+    "tradecraft-engine@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft-providers@0.3.0": {
+    "tradecraft-providers@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft-ui-egui@0.3.0": {
+    "tradecraft-ui-egui@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },
-    "tradecraft@0.3.0": {
+    "tradecraft@0.4.0": {
       "license": "MIT",
       "source": "workspace/path"
     },

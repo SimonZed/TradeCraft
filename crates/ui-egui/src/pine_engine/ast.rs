@@ -1,6 +1,8 @@
 //! The parsed shape of a script: statements, expressions, inputs and the diagnostics the editor
 //! shows for what this subset does not run.
 
+use std::collections::HashSet;
+
 use crate::pine_engine::value::Value;
 
 /// Identifies a call site, so a builtin keeps its state (`ta.ema`'s previous value) between bars
@@ -102,6 +104,135 @@ pub enum Expr {
         subject: Option<Box<Expr>>,
         arms: Vec<SwitchArm>,
     },
+}
+
+impl Expr {
+    /// Visits this expression and every subexpression, for the analyses a run does once.
+    pub fn visit(&self, f: &mut impl FnMut(&Expr)) {
+        f(self);
+        match self {
+            Expr::Member { target, .. } => target.visit(f),
+            Expr::Call {
+                receiver, args, ..
+            } => {
+                if let Some(receiver) = receiver {
+                    receiver.visit(f);
+                }
+                for arg in args {
+                    arg.value.visit(f);
+                }
+            }
+            Expr::Index { target, index } => {
+                target.visit(f);
+                index.visit(f);
+            }
+            Expr::Unary { value, .. } => value.visit(f),
+            Expr::Binary { left, right, .. } => {
+                left.visit(f);
+                right.visit(f);
+            }
+            Expr::Ternary {
+                cond,
+                then,
+                otherwise,
+            } => {
+                cond.visit(f);
+                then.visit(f);
+                otherwise.visit(f);
+            }
+            Expr::If {
+                cond,
+                then,
+                otherwise,
+            } => {
+                cond.visit(f);
+                visit_stmts(then, f);
+                if let Some(otherwise) = otherwise {
+                    visit_stmts(otherwise, f);
+                }
+            }
+            Expr::Array(items) => {
+                for item in items {
+                    item.visit(f);
+                }
+            }
+            Expr::Lambda { body, .. } => body.visit(f),
+            Expr::Switch { subject, arms } => {
+                if let Some(subject) = subject {
+                    subject.visit(f);
+                }
+                for arm in arms {
+                    for cond in &arm.conds {
+                        cond.visit(f);
+                    }
+                    visit_stmts(&arm.body, f);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Visits every expression a block holds, including those inside functions and types.
+pub fn visit_stmts(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
+    for statement in body {
+        match statement {
+            Stmt::Assign { value, .. } | Stmt::Expr(value) | Stmt::Tuple { value, .. } => {
+                value.visit(f)
+            }
+            Stmt::If {
+                cond,
+                then,
+                otherwise,
+            } => {
+                cond.visit(f);
+                visit_stmts(then, f);
+                if let Some(otherwise) = otherwise {
+                    visit_stmts(otherwise, f);
+                }
+            }
+            Stmt::For {
+                from,
+                to,
+                step,
+                body,
+                ..
+            } => {
+                from.visit(f);
+                to.visit(f);
+                if let Some(step) = step {
+                    step.visit(f);
+                }
+                visit_stmts(body, f);
+            }
+            Stmt::ForIn { iterable, body, .. } => {
+                iterable.visit(f);
+                visit_stmts(body, f);
+            }
+            Stmt::While { cond, body, .. } => {
+                cond.visit(f);
+                visit_stmts(body, f);
+            }
+            Stmt::FieldAssign { target, value, .. } => {
+                target.visit(f);
+                value.visit(f);
+            }
+            Stmt::Function(function) => {
+                for default in function.defaults.iter().flatten() {
+                    default.visit(f);
+                }
+                visit_stmts(&function.body, f);
+            }
+            Stmt::Type(declaration) => {
+                for field in &declaration.fields {
+                    if let Some(default) = &field.default {
+                        default.visit(f);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// One branch of a `switch`.
@@ -208,4 +339,6 @@ pub struct Program {
     pub body: Block,
     pub inputs: Vec<InputDecl>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The call sites the script reads with `[n]`: found once, since every run needs them.
+    pub indexed: HashSet<NodeId>,
 }

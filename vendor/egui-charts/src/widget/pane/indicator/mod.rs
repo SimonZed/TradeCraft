@@ -92,6 +92,21 @@ pub struct IndicatorPane {
     pub(super) primitive_axis_labels: Vec<(crate::chart::primitives::PriceAxisLabel, PriceMap)>,
     pub(super) axis_options: crate::config::PriceAxisOptions,
     pub(super) legend_backdrop: f32,
+    /// The background of the chart showing the pane: the rect its gradient spans, its style and
+    /// its solid colour. A pane shown on its own has the theme's chart background.
+    pub(super) background: Option<(Rect, crate::config::BackgroundStyle, egui::Color32)>,
+    /// Colour of the legend text and the axis labels, the scale text colour of the chart showing
+    /// the pane. A pane shown on its own takes them from the egui style and the theme.
+    pub(super) text_color: Option<egui::Color32>,
+}
+
+impl std::fmt::Debug for IndicatorPane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndicatorPane")
+            .field("config", &self.config)
+            .field("overlay", &self.overlay)
+            .finish_non_exhaustive()
+    }
 }
 
 impl IndicatorPane {
@@ -117,7 +132,17 @@ impl IndicatorPane {
             primitive_axis_labels: Vec::new(),
             axis_options,
             legend_backdrop: 0.6,
+            background: None,
+            text_color: None,
         }
+    }
+
+    /// The colour of the background behind `pos`.
+    pub(super) fn background_at(&self, ctx: &egui::Context, pos: Pos2) -> egui::Color32 {
+        self.background.map_or_else(
+            || ctx.active_theme().chart.bg,
+            |(frame, style, color)| crate::widget::frame::background_at(frame, style, color, pos),
+        )
     }
 
     /// Render the indicator panel with proper x-axis alignment
@@ -197,6 +222,7 @@ impl IndicatorPane {
             y_min,
             y_max,
             indicator,
+            visible_range.end.checked_sub(1),
             Some(crate::scales::PriceScaleId::Right),
             None,
         );
@@ -293,6 +319,7 @@ impl IndicatorPane {
             y_min,
             y_max,
             indicator,
+            crate::chart::rendering::axes::last_bar_in_view(&horizontal),
             Some(crate::scales::PriceScaleId::Right),
             None,
         );
@@ -376,7 +403,9 @@ impl IndicatorPane {
         // Get chart background and text colors from theme
         let colors = ui.active_theme().chart;
         let chart_bg = colors.bg;
-        let text_color = ui.style().visuals.text_color();
+        let text_color = self
+            .text_color
+            .unwrap_or_else(|| ui.style().visuals.text_color());
         let grid_color = colors.grid_line;
 
         // Get live theme colors for zones
@@ -401,9 +430,17 @@ impl IndicatorPane {
 
         let painter = &ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
 
-        // Fill background
+        // Fill background: the part of the chart's that lies behind the pane, also when a container
+        // paints the chart's: the fill hides the crosshair line the price frame draws through panes.
         if !self.overlay {
-            painter.rect_filled(rect, 0.0, chart_bg);
+            match self.background {
+                Some((frame, style, color)) => {
+                    crate::widget::frame::paint_background(painter, frame, rect, style, color);
+                }
+                None => {
+                    painter.rect_filled(rect, 0.0, chart_bg);
+                }
+            }
         }
 
         // Calculate drawing area to match main chart layout
@@ -629,7 +666,15 @@ impl IndicatorPane {
             axis_foregrounds.extend(crate::widget::primitives::take_shapes(painter, start));
             // Draw y-axis labels
             self.measured_axis_width = self.draw_y_axis_labels(
-                painter, rect, chart_rect, y_min, y_max, indicator, axis, tag,
+                painter,
+                rect,
+                chart_rect,
+                y_min,
+                y_max,
+                indicator,
+                crate::chart::rendering::axes::last_bar_in_view(&mapping),
+                axis,
+                tag,
             );
         }
 
@@ -652,7 +697,7 @@ impl IndicatorPane {
                 ui,
                 row,
                 controls,
-                true,
+                Some(self.background_at(ui.ctx(), controls.center())),
                 response.id.with("study_controls"),
                 indicator,
             )
@@ -880,7 +925,8 @@ mod tests {
     }
 
     /// A fitted pane keeps a study's levels in view when its values lie between them, and a
-    /// hidden level holds the scale open only when its value line is visible.
+    /// hidden level holds the scale open only when its value line is visible. Williams %R fits a
+    /// source that reads past -100 to 0 rather than clipping it.
     #[test]
     fn fitted_panes_keep_visible_levels_in_view() {
         let bars: Vec<_> = [(10.0, 8.0, 9.0), (12.0, 9.0, 11.0), (11.0, 7.0, 8.0)]
@@ -916,5 +962,15 @@ mod tests {
             assert!(low < 38.2, "{low}..{high}");
             assert_eq!(high > 61.8, shown, "{low}..{high}");
         }
+
+        // Williams %R fits a source past its bounds. With the same bars and a two-bar window, a
+        // source of 14 on bar 1 gives (12 - 14) / (12 - 8) * -100 = 50 and 9 on bar 2 gives
+        // (12 - 9) / (12 - 7) * -100 = -60, so with its levels at -20 and -80 the values and
+        // levels span -80 to 50.
+        let mut study =
+            crate::studies::ConfiguredStudy::new(Box::new(crate::studies::WilliamsR::new(2)));
+        study.update_source(&bars, 0, &[f64::NAN, 14.0, 9.0]);
+        let (low, high) = fit(&study);
+        assert!(low < -80.0 && high > 50.0, "{low}..{high}");
     }
 }

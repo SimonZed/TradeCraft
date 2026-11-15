@@ -50,6 +50,23 @@ fn tab_price(price: f64) -> String {
     CurrencyFormatter::new("", if price.abs() < 1.0 { 4 } else { 2 }).format(price)
 }
 
+fn option_tab_symbol(symbol: &str) -> Option<String> {
+    if !symbol.is_ascii() || symbol.len() <= 15 { return None; }
+    let (root, suffix) = symbol.split_at(symbol.len() - 15);
+    if !root.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'/') { return None; }
+    chrono::NaiveDate::parse_from_str(&suffix[..6], "%y%m%d").ok()?;
+    let kind = &suffix[6..7];
+    if kind != "C" && kind != "P" { return None; }
+    if !suffix[7..].bytes().all(|b| b.is_ascii_digit()) { return None; }
+    let strike: u32 = suffix[7..].parse().ok()?;
+    let whole = strike / 1000;
+    let fraction = strike % 1000;
+    let strike = if fraction == 0 { whole.to_string() } else {
+        format!("{whole}.{fraction:03}").trim_end_matches('0').to_owned()
+    };
+    Some(format!("{root} {strike}{kind}"))
+}
+
 fn show_chart_tab(
     ui: &mut egui::Ui,
     symbol: &str,
@@ -59,7 +76,9 @@ fn show_chart_tab(
     closable: bool,
     theme: &egui_charts::theme::Theme,
 ) -> (bool, bool) {
-    let shown_symbol = symbol.rsplit(':').next().unwrap_or(symbol);
+    let short_symbol = symbol.rsplit(':').next().unwrap_or(symbol);
+    let formatted_symbol = option_tab_symbol(short_symbol);
+    let shown_symbol = formatted_symbol.as_deref().unwrap_or(short_symbol);
     let font = egui::FontId::proportional(15.0);
     let text_color = theme.ui.text;
     let painter = ui.painter().clone();
@@ -75,6 +94,7 @@ fn show_chart_tab(
         + change_text.as_ref().map_or(0.0, |text| measure(text) + 6.0)
         + measure(&detail) + if closable { 34.0 } else { 10.0 };
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 42.0), egui::Sense::click());
+    let response = if formatted_symbol.is_some() { response.on_hover_text(symbol) } else { response };
     let bg = if active { if theme.dark { egui::Color32::from_rgb(15, 16, 18) } else { theme.ui.panel_bg } }
         else if response.hovered() { theme.ui.btn_bg_hover } else { egui::Color32::TRANSPARENT };
     if bg != egui::Color32::TRANSPARENT { ui.painter().rect_filled(rect, egui::CornerRadius::same(8), bg); }
@@ -596,6 +616,13 @@ impl Terminal {
         true
     }
 
+    /// Open a symbol in a new chart tab while retaining the current workspace.
+    pub fn open_symbol_tab(&mut self, symbol: &str) {
+        if self.new_layout(None) {
+            self.switch_symbol(symbol);
+        }
+    }
+
     fn close_layout(&mut self, index: usize) {
         if self.layouts.tabs.len() == 1 {
             return;
@@ -1037,17 +1064,14 @@ mod tests {
                 show_economic_events: true,
                 ..Default::default()
             });
+        let mut hidden = ToolAvailability::default();
+        hidden.visible = false;
+        hidden.enabled = false;
         terminal
             .chart_mut()
             .drawings_mut()
             .registry
-            .set_availability(
-                DrawingToolType::TrendLine,
-                ToolAvailability {
-                    visible: false,
-                    enabled: false,
-                },
-            );
+            .set_availability(DrawingToolType::TrendLine, hidden);
         let mut drawing = Drawing::new(7, DrawingToolType::HorizontalLine);
         drawing.completed = true;
         drawing.chart_points.push(ChartPoint::new(10.0, 42.0));

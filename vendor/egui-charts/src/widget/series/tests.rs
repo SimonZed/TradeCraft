@@ -212,6 +212,37 @@ fn window(start: i64, len: i64) -> Vec<Bar> {
     (start..start + len).map(|i| bar(i * 60, 10.0)).collect()
 }
 
+/// The bar setters report whether `series` holds bars, not whether the call changed them.
+#[test]
+fn bar_setters_report_whether_the_series_holds_bars() {
+    let mut chart = Chart::new(BarData::from_bars(vec![bar(0, 10.0), bar(60, 11.0)]));
+    let added = chart.add_series(SeriesOptions::default());
+    let removed = chart.add_series(SeriesOptions::default());
+    assert!(chart.remove_series(removed));
+    let study = chart.add_indicator(Box::new(SMA::new(2)));
+    for (series, holds_bars) in [
+        (SeriesId::MAIN, true),
+        (added, true),
+        (removed, false),
+        (study, false),
+    ] {
+        let results = [
+            chart.set_data(series, vec![bar(0, 10.0)]),
+            chart.update(series, bar(60, 11.0)),
+            chart.set_bar_limit(series, NonZeroUsize::new(10)),
+            chart.set_markers(series, Vec::new()),
+            chart.set_marker_options(series, MarkerOptions::default()),
+            chart.set_price_lines(series, Vec::new()),
+            chart.set_change_markers(series, None),
+        ];
+        assert_eq!(results, [holds_bars; 7], "{series:?}");
+    }
+    // A negative volume is invalid, so the bar is dropped.
+    let mut dropped = bar(120, 12.0);
+    dropped.volume = -1.0;
+    assert!(chart.update(SeriesId::MAIN, dropped));
+}
+
 /// Streaming keeps the configured live offset, or the same scrolled-back element.
 #[test]
 fn appended_bars_keep_the_view() {
@@ -525,7 +556,8 @@ fn set_data_newer_window_keeps_a_scrolled_back_view_on_bars() {
         let expected = match minute {
             ..165 => -30.0 - (minute - 99) as f32,
             165 => 0.0,
-            _ => 2.5,
+            // TradeCraft keeps the user's offset rather than restoring the default margin.
+            _ => 0.0,
         };
         assert_eq!(
             chart.state.time_scale().right_offset(),
@@ -540,7 +572,7 @@ fn set_data_newer_window_keeps_a_scrolled_back_view_on_bars() {
     // left edge, then that bar stays there as the window moves on. At 23 px a bar the right
     // edge of the stopped view reads back a rounding error short of a full plot.
     let mut chart = scrolled(23.0, -30.0);
-    let visible = f64::from(chart.state.time_scale().width()) / 23.0;
+    let visible = (f64::from(chart.state.time_scale().width()) - 1.0) / 23.0;
     for start in 1..=60 {
         chart.set_data(SeriesId::MAIN, window(start, 100));
         frame(&ctx, &mut chart, start as f64, Vec::new());
@@ -556,7 +588,7 @@ fn set_data_newer_window_keeps_a_scrolled_back_view_on_bars() {
     // view. Indices 56, 43 and 30 at the right edge of a plot of about 35 bars, and the 88
     // bars left fill the plot from its left border.
     let mut chart = scrolled(20.0, -30.0);
-    let visible = f64::from(chart.state.time_scale().width()) / 20.0;
+    let visible = (f64::from(chart.state.time_scale().width()) - 1.0) / 20.0;
     chart.set_bar_limit(SeriesId::MAIN, NonZeroUsize::new(100));
     for minute in 100..=126 {
         chart.update(SeriesId::MAIN, bar(minute * 60, 10.0));
@@ -711,9 +743,15 @@ fn updates_reach_bars_studies_and_revision() {
         let revision = chart.state.revision();
         for action in actions {
             match action {
-                Update(bar) => chart.update(SeriesId::MAIN, bar),
-                SetData(bars) => chart.set_data(SeriesId::MAIN, bars),
-                Limit(count) => chart.set_bar_limit(SeriesId::MAIN, NonZeroUsize::new(count)),
+                Update(bar) => {
+                    chart.update(SeriesId::MAIN, bar);
+                }
+                SetData(bars) => {
+                    chart.set_data(SeriesId::MAIN, bars);
+                }
+                Limit(count) => {
+                    chart.set_bar_limit(SeriesId::MAIN, NonZeroUsize::new(count));
+                }
                 RemoveOldest(count) => {
                     assert_eq!(
                         chart.remove_oldest_bars(SeriesId::MAIN, count),
