@@ -1,5 +1,6 @@
 use crate::terminal_feed::Feed;
 use crate::terminal_storage::FileStorage;
+use crate::graphics::GraphicsBackend;
 use crate::window_settings::WindowSettings;
 use egui_charts::model::Timeframe;
 use egui_charts::ui::top_toolbar::TopToolbarAction;
@@ -165,6 +166,7 @@ pub struct TerminalApp {
     error: String,
     quit: QuitState,
     window_settings: WindowSettings,
+    graphics_backend: GraphicsBackend,
     #[cfg(windows)]
     tray: Option<tray::Tray>,
     menu_icon: Option<egui::TextureHandle>,
@@ -215,6 +217,7 @@ impl TerminalApp {
             alert_error,
             quit: QuitState::Idle,
             window_settings,
+            graphics_backend: GraphicsBackend::load(),
             #[cfg(windows)]
             tray: None,
             menu_icon: None,
@@ -271,6 +274,10 @@ impl TerminalApp {
     fn save(&mut self) {
         if !self.terminal.flush_storage() {
             self.error = "Finishing workspace save. Please try again in a moment.".into();
+            return;
+        }
+        if let Err(error) = self.graphics_backend.save() {
+            self.error = error;
             return;
         }
         match self.engine.save_settings(self.draft, &self.token) {
@@ -642,6 +649,22 @@ impl TerminalApp {
                             ui.label("Stored in Windows Credential Locker.");
                         }
                     }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Graphics backend");
+                        egui::ComboBox::from_id_salt("graphics-backend")
+                            .selected_text(self.graphics_backend.label())
+                            .show_ui(ui, |ui| {
+                                for choice in GraphicsBackend::AVAILABLE {
+                                    ui.selectable_value(
+                                        &mut self.graphics_backend,
+                                        *choice,
+                                        choice.label(),
+                                    );
+                                }
+                            });
+                    });
+                    ui.label("Applied the next time TradeCraft starts. WGPU_BACKEND overrides it.");
                     if !self.error.is_empty() {
                         ui.colored_label(egui::Color32::LIGHT_RED, &self.error);
                     }

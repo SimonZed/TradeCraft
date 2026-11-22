@@ -387,7 +387,7 @@ pub fn run() -> eframe::Result {
                     width: 64,
                     height: 64,
                 })),
-            wgpu_options: graphics::wgpu_options(),
+            wgpu_options: graphics::wgpu_options(graphics::GraphicsBackend::load()),
             ..Default::default()
         },
         Box::new(move |cc| {
