@@ -11,6 +11,7 @@
     )
 )]
 
+mod graphics;
 mod terminal_app;
 mod options_view;
 mod pine_engine;
@@ -386,6 +387,7 @@ pub fn run() -> eframe::Result {
                     width: 64,
                     height: 64,
                 })),
+            wgpu_options: graphics::wgpu_options(),
             ..Default::default()
         },
         Box::new(move |cc| {
