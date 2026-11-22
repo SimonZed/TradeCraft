@@ -678,6 +678,7 @@ impl TerminalApp {
             }
         }
         self.show_quit_attention(ui.ctx());
+        crate::graphics::frame_finished();
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(250));
     }

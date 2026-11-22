@@ -383,7 +383,6 @@ pub fn run() -> eframe::Result {
         env!("CARGO_PKG_VERSION"),
         if cfg!(feature = "vibestrader-credential") { "personal" } else { "community" }
     ));
-    startup_log::log(graphics::describe_request(graphics_backend));
     let result = eframe::run_native(
         "TradeCraft",
         eframe::NativeOptions {
@@ -396,7 +395,7 @@ pub fn run() -> eframe::Result {
                     width: 64,
                     height: 64,
                 })),
-            wgpu_options: graphics::wgpu_options(graphics_backend),
+            wgpu_options: graphics::startup(graphics_backend),
             ..Default::default()
         },
         Box::new(move |cc| {
