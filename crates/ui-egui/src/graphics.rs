@@ -100,6 +100,31 @@ fn requested_backends(env: Option<Backends>, choice: GraphicsBackend) -> Option<
     choice.backends()
 }
 
+/// Describes the backend request for the log.
+pub(crate) fn describe_request(choice: GraphicsBackend) -> String {
+    let env = Backends::from_env();
+    let effective = env.or_else(|| choice.backends());
+    format!(
+        "graphics backend requested: setting={}, WGPU_BACKEND={}, effective={}",
+        choice.label(),
+        std::env::var("WGPU_BACKEND").unwrap_or_else(|_| "unset".into()),
+        effective.map_or_else(|| "wgpu default".into(), |b| format!("{b:?}"))
+    )
+}
+
+/// Logs the adapter chosen by wgpu.
+pub(crate) fn log_adapter(state: Option<&eframe::egui_wgpu::RenderState>) {
+    let Some(state) = state else {
+        crate::startup_log::log("graphics adapter: unavailable (no wgpu render state)");
+        return;
+    };
+    let info = state.adapter.get_info();
+    crate::startup_log::log(format!(
+        "graphics adapter: {} | backend {:?} | type {:?} | driver {} {}",
+        info.name, info.backend, info.device_type, info.driver, info.driver_info
+    ));
+}
+
 /// The renderer configuration. `WGPU_BACKEND`, when set, always takes priority.
 pub(crate) fn wgpu_options(choice: GraphicsBackend) -> WgpuConfiguration {
     let mut options = WgpuConfiguration::default();
