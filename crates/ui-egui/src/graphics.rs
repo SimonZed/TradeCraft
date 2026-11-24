@@ -3,6 +3,24 @@
 use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup};
 use eframe::wgpu::Backends;
 
+/// The operating systems whose backend choices differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Os {
+    Windows,
+    MacOs,
+    Linux,
+}
+
+impl Os {
+    pub(crate) const CURRENT: Self = if cfg!(windows) {
+        Self::Windows
+    } else if cfg!(target_os = "macos") {
+        Self::MacOs
+    } else {
+        Self::Linux
+    };
+}
+
 /// The user's graphics backend choice, applied at the next start.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum GraphicsBackend {
@@ -11,25 +29,29 @@ pub(crate) enum GraphicsBackend {
     Dx12,
     Vulkan,
     OpenGl,
+    Metal,
+}
+
+/// Choices offered on an operating system.
+///
+/// macOS offers only Metal: wgpu's OpenGL backend there needs ANGLE, which this build lacks.
+pub(crate) fn available_backends(os: Os) -> &'static [GraphicsBackend] {
+    use GraphicsBackend::*;
+    match os {
+        Os::Windows => &[Auto, Dx12, Vulkan, OpenGl],
+        Os::MacOs => &[Auto, Metal],
+        Os::Linux => &[Auto, Vulkan, OpenGl],
+    }
 }
 
 impl GraphicsBackend {
-    /// Choices offered on this platform.
-    pub(crate) const AVAILABLE: &'static [Self] = &[
-        Self::Auto,
-        #[cfg(windows)]
-        Self::Dx12,
-        #[cfg(not(target_os = "macos"))]
-        Self::Vulkan,
-        Self::OpenGl,
-    ];
-
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Auto => "Auto",
             Self::Dx12 => "DX12",
             Self::Vulkan => "Vulkan",
             Self::OpenGl => "OpenGL",
+            Self::Metal => "Metal",
         }
     }
 
@@ -39,11 +61,13 @@ impl GraphicsBackend {
             Self::Dx12 => "dx12",
             Self::Vulkan => "vulkan",
             Self::OpenGl => "opengl",
+            Self::Metal => "metal",
         }
     }
 
-    fn from_key(key: &str) -> Self {
-        Self::AVAILABLE
+    /// A saved name that is not offered on `os` is treated as Auto so the app can always start.
+    fn from_key(os: Os, key: &str) -> Self {
+        available_backends(os)
             .iter()
             .copied()
             .find(|choice| choice.key() == key)
@@ -53,13 +77,16 @@ impl GraphicsBackend {
     /// Backends to request. `None` keeps wgpu's own default.
     ///
     /// Auto selects DX12 on Windows: some Intel iGPU Vulkan drivers crash during
-    /// initialisation. Other platforms keep wgpu's defaults.
-    fn backends(self) -> Option<Backends> {
-        match self {
-            Self::Auto => cfg!(windows).then_some(Backends::DX12),
-            Self::Dx12 => Some(Backends::DX12),
-            Self::Vulkan => Some(Backends::VULKAN),
-            Self::OpenGl => Some(Backends::GL),
+    /// initialisation. Other platforms keep wgpu's defaults. Any explicit choice on
+    /// macOS uses Metal.
+    fn backends(self, os: Os) -> Option<Backends> {
+        match (self, os) {
+            (Self::Auto, Os::Windows) => Some(Backends::DX12),
+            (Self::Auto, _) => None,
+            (_, Os::MacOs) | (Self::Metal, _) => Some(Backends::METAL),
+            (Self::Dx12, _) => Some(Backends::DX12),
+            (Self::Vulkan, _) => Some(Backends::VULKAN),
+            (Self::OpenGl, _) => Some(Backends::GL),
         }
     }
 
@@ -77,7 +104,11 @@ impl GraphicsBackend {
         Self::path()
             .and_then(|path| std::fs::read(path).ok())
             .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
-            .and_then(|value| value["backend"].as_str().map(Self::from_key))
+            .and_then(|value| {
+                value["backend"]
+                    .as_str()
+                    .map(|key| Self::from_key(Os::CURRENT, key))
+            })
             .unwrap_or_default()
     }
 
@@ -93,11 +124,11 @@ impl GraphicsBackend {
 }
 
 /// Backends to request: `WGPU_BACKEND` first, then the saved choice.
-fn requested_backends(env: Option<Backends>, choice: GraphicsBackend) -> Option<Backends> {
+fn requested_backends(env: Option<Backends>, choice: GraphicsBackend, os: Os) -> Option<Backends> {
     if env.is_some() {
         return None;
     }
-    choice.backends()
+    choice.backends(os)
 }
 
 fn backend_key(backends: Option<Backends>) -> &'static str {
@@ -105,6 +136,7 @@ fn backend_key(backends: Option<Backends>) -> &'static str {
         Some(b) if b == Backends::DX12 => "dx12",
         Some(b) if b == Backends::VULKAN => "vulkan",
         Some(b) if b == Backends::GL => "opengl",
+        Some(b) if b == Backends::METAL => "metal",
         _ => "default",
     }
 }
@@ -133,7 +165,7 @@ fn plan(
     }
     match previous_attempt.and_then(fallback_after) {
         Some(backends) => (Some(backends), true),
-        None => (requested_backends(env, choice), false),
+        None => (requested_backends(env, choice, Os::CURRENT), false),
     }
 }
 
@@ -216,48 +248,70 @@ pub(crate) fn log_adapter(state: Option<&eframe::egui_wgpu::RenderState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use GraphicsBackend::*;
+
+    #[test]
+    fn available_backends_depend_on_the_operating_system() {
+        assert_eq!(
+            available_backends(Os::Windows),
+            &[Auto, Dx12, Vulkan, OpenGl]
+        );
+        assert_eq!(available_backends(Os::MacOs), &[Auto, Metal]);
+        assert_eq!(available_backends(Os::Linux), &[Auto, Vulkan, OpenGl]);
+    }
+
+    #[test]
+    fn explicit_choices_use_metal_on_macos() {
+        for choice in [Dx12, Vulkan, OpenGl, Metal] {
+            assert_eq!(choice.backends(Os::MacOs), Some(Backends::METAL));
+        }
+        assert_eq!(Auto.backends(Os::MacOs), None);
+    }
+
+    #[test]
+    fn saved_opengl_is_ignored_on_macos() {
+        assert_eq!(GraphicsBackend::from_key(Os::MacOs, "opengl"), Auto);
+        assert_eq!(GraphicsBackend::from_key(Os::MacOs, "vulkan"), Auto);
+        assert_eq!(GraphicsBackend::from_key(Os::MacOs, "metal"), Metal);
+        assert_eq!(GraphicsBackend::from_key(Os::Windows, "opengl"), OpenGl);
+        assert_eq!(GraphicsBackend::from_key(Os::Linux, "dx12"), Auto);
+    }
 
     #[test]
     fn environment_variable_overrides_setting_and_default() {
-        assert_eq!(
-            requested_backends(Some(Backends::VULKAN), GraphicsBackend::OpenGl),
-            None
-        );
-        assert_eq!(
-            requested_backends(None, GraphicsBackend::Auto),
-            cfg!(windows).then_some(Backends::DX12)
-        );
-        assert_eq!(
-            requested_backends(None, GraphicsBackend::Vulkan),
-            Some(Backends::VULKAN)
-        );
-        assert_eq!(
-            requested_backends(None, GraphicsBackend::OpenGl),
-            Some(Backends::GL)
-        );
+        let os = Os::Windows;
+        assert_eq!(requested_backends(Some(Backends::VULKAN), OpenGl, os), None);
+        assert_eq!(requested_backends(None, Auto, os), Some(Backends::DX12));
+        assert_eq!(requested_backends(None, Vulkan, os), Some(Backends::VULKAN));
+        assert_eq!(requested_backends(None, OpenGl, os), Some(Backends::GL));
+        assert_eq!(requested_backends(None, Auto, Os::Linux), None);
     }
 
     #[test]
     fn saved_names_round_trip_and_unknown_names_fall_back_to_auto() {
-        for choice in GraphicsBackend::AVAILABLE {
-            assert_eq!(GraphicsBackend::from_key(choice.key()), *choice);
+        for os in [Os::Windows, Os::MacOs, Os::Linux] {
+            for choice in available_backends(os) {
+                assert_eq!(GraphicsBackend::from_key(os, choice.key()), *choice);
+            }
+            assert_eq!(GraphicsBackend::from_key(os, "nonsense"), Auto);
         }
-        assert_eq!(GraphicsBackend::from_key("nonsense"), GraphicsBackend::Auto);
     }
 
     #[test]
     fn crash_fallback_tries_dx12_then_opengl_on_windows() {
-        let auto = GraphicsBackend::Auto;
-        assert_eq!(plan(None, auto, None), (auto.backends(), false));
+        let auto = Auto;
+        assert_eq!(plan(None, auto, None), (auto.backends(Os::CURRENT), false));
         if cfg!(windows) {
             assert_eq!(
                 plan(None, auto, Some("vulkan")),
                 (Some(Backends::DX12), true)
             );
             assert_eq!(plan(None, auto, Some("dx12")), (Some(Backends::GL), true));
-            assert_eq!(plan(None, auto, Some("opengl")), (auto.backends(), false));
         } else {
-            assert_eq!(plan(None, auto, Some("dx12")), (auto.backends(), false));
+            assert_eq!(
+                plan(None, auto, Some("dx12")),
+                (auto.backends(Os::CURRENT), false)
+            );
         }
         assert_eq!(
             plan(Some(Backends::VULKAN), auto, Some("dx12")),

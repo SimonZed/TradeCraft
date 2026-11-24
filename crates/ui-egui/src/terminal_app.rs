@@ -1,6 +1,6 @@
 use crate::terminal_feed::Feed;
 use crate::terminal_storage::FileStorage;
-use crate::graphics::GraphicsBackend;
+use crate::graphics::{GraphicsBackend, Os, available_backends};
 use crate::window_settings::WindowSettings;
 use egui_charts::model::Timeframe;
 use egui_charts::ui::top_toolbar::TopToolbarAction;
@@ -655,7 +655,7 @@ impl TerminalApp {
                         egui::ComboBox::from_id_salt("graphics-backend")
                             .selected_text(self.graphics_backend.label())
                             .show_ui(ui, |ui| {
-                                for choice in GraphicsBackend::AVAILABLE {
+                                for choice in available_backends(Os::CURRENT) {
                                     ui.selectable_value(
                                         &mut self.graphics_backend,
                                         *choice,
