@@ -34,7 +34,7 @@ On Windows, closing the window minimizes TradeCraft to the taskbar. Click its no
 
 If the previous start never finished initialising graphics, the next start automatically tries DX12 and then OpenGL for that start only. The saved setting is unchanged.
 
-TradeCraft writes `tradecraft.log` in its application-data folder (`%LOCALAPPDATA%\TradeCraft`). It records the requested backend, the adapter and driver version wgpu selected, panics and initialisation errors; include it when reporting a graphics problem. The log is rotated to `tradecraft.log.old` at 256 KB. The Graphics backend setting is stored in `graphics-community.json` or `graphics-personal.json`, next to the other settings.
+TradeCraft writes `tradecraft.log` in its application-data folder (`%LOCALAPPDATA%\TradeCraft`). It records the requested backend, the adapter and driver version wgpu selected, panics and initialisation errors; include it when reporting a graphics problem. The log is rotated to `tradecraft.log.old` at 256 KB. The Graphics backend setting is stored in `graphics-community.json` or `graphics-personal.json`, each beside its own crash marker (`.marker`). On macOS only Auto and Metal are offered.
 
 ### macOS build
 

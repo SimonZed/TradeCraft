@@ -7,7 +7,7 @@ use eframe::wgpu::Backends;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Os {
     Windows,
-    MacOs,
+    Mac,
     Linux,
 }
 
@@ -15,7 +15,7 @@ impl Os {
     pub(crate) const CURRENT: Self = if cfg!(windows) {
         Self::Windows
     } else if cfg!(target_os = "macos") {
-        Self::MacOs
+        Self::Mac
     } else {
         Self::Linux
     };
@@ -39,7 +39,7 @@ pub(crate) fn available_backends(os: Os) -> &'static [GraphicsBackend] {
     use GraphicsBackend::*;
     match os {
         Os::Windows => &[Auto, Dx12, Vulkan, OpenGl],
-        Os::MacOs => &[Auto, Metal],
+        Os::Mac => &[Auto, Metal],
         Os::Linux => &[Auto, Vulkan, OpenGl],
     }
 }
@@ -83,7 +83,7 @@ impl GraphicsBackend {
         match (self, os) {
             (Self::Auto, Os::Windows) => Some(Backends::DX12),
             (Self::Auto, _) => None,
-            (_, Os::MacOs) | (Self::Metal, _) => Some(Backends::METAL),
+            (_, Os::Mac) | (Self::Metal, _) => Some(Backends::METAL),
             (Self::Dx12, _) => Some(Backends::DX12),
             (Self::Vulkan, _) => Some(Backends::VULKAN),
             (Self::OpenGl, _) => Some(Backends::GL),
@@ -276,23 +276,23 @@ mod tests {
             available_backends(Os::Windows),
             &[Auto, Dx12, Vulkan, OpenGl]
         );
-        assert_eq!(available_backends(Os::MacOs), &[Auto, Metal]);
+        assert_eq!(available_backends(Os::Mac), &[Auto, Metal]);
         assert_eq!(available_backends(Os::Linux), &[Auto, Vulkan, OpenGl]);
     }
 
     #[test]
     fn explicit_choices_use_metal_on_macos() {
         for choice in [Dx12, Vulkan, OpenGl, Metal] {
-            assert_eq!(choice.backends(Os::MacOs), Some(Backends::METAL));
+            assert_eq!(choice.backends(Os::Mac), Some(Backends::METAL));
         }
-        assert_eq!(Auto.backends(Os::MacOs), None);
+        assert_eq!(Auto.backends(Os::Mac), None);
     }
 
     #[test]
     fn saved_opengl_is_ignored_on_macos() {
-        assert_eq!(GraphicsBackend::from_key(Os::MacOs, "opengl"), Auto);
-        assert_eq!(GraphicsBackend::from_key(Os::MacOs, "vulkan"), Auto);
-        assert_eq!(GraphicsBackend::from_key(Os::MacOs, "metal"), Metal);
+        assert_eq!(GraphicsBackend::from_key(Os::Mac, "opengl"), Auto);
+        assert_eq!(GraphicsBackend::from_key(Os::Mac, "vulkan"), Auto);
+        assert_eq!(GraphicsBackend::from_key(Os::Mac, "metal"), Metal);
         assert_eq!(GraphicsBackend::from_key(Os::Windows, "opengl"), OpenGl);
         assert_eq!(GraphicsBackend::from_key(Os::Linux, "dx12"), Auto);
     }
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn saved_names_round_trip_and_unknown_names_fall_back_to_auto() {
-        for os in [Os::Windows, Os::MacOs, Os::Linux] {
+        for os in [Os::Windows, Os::Mac, Os::Linux] {
             for choice in available_backends(os) {
                 assert_eq!(GraphicsBackend::from_key(os, choice.key()), *choice);
             }
