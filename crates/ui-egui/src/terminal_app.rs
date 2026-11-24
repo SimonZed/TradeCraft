@@ -167,6 +167,7 @@ pub struct TerminalApp {
     quit: QuitState,
     window_settings: WindowSettings,
     graphics_backend: GraphicsBackend,
+    graphics_error: String,
     #[cfg(windows)]
     tray: Option<tray::Tray>,
     menu_icon: Option<egui::TextureHandle>,
@@ -218,6 +219,7 @@ impl TerminalApp {
             quit: QuitState::Idle,
             window_settings,
             graphics_backend: GraphicsBackend::load(),
+            graphics_error: String::new(),
             #[cfg(windows)]
             tray: None,
             menu_icon: None,
@@ -274,10 +276,6 @@ impl TerminalApp {
     fn save(&mut self) {
         if !self.terminal.flush_storage() {
             self.error = "Finishing workspace save. Please try again in a moment.".into();
-            return;
-        }
-        if let Err(error) = self.graphics_backend.save() {
-            self.error = error;
             return;
         }
         match self.engine.save_settings(self.draft, &self.token) {
@@ -650,6 +648,8 @@ impl TerminalApp {
                         }
                     }
                     ui.separator();
+                    // Saved on its own, apart from the provider settings and their validation.
+                    let previous_graphics = self.graphics_backend;
                     ui.horizontal(|ui| {
                         ui.label("Graphics backend");
                         egui::ComboBox::from_id_salt("graphics-backend")
@@ -664,7 +664,19 @@ impl TerminalApp {
                                 }
                             });
                     });
+                    if self.graphics_backend != previous_graphics {
+                        match self.graphics_backend.save() {
+                            Ok(()) => self.graphics_error.clear(),
+                            Err(error) => {
+                                self.graphics_backend = previous_graphics;
+                                self.graphics_error = error;
+                            }
+                        }
+                    }
                     ui.label("Applied the next time TradeCraft starts. WGPU_BACKEND overrides it.");
+                    if !self.graphics_error.is_empty() {
+                        ui.colored_label(egui::Color32::LIGHT_RED, &self.graphics_error);
+                    }
                     if !self.error.is_empty() {
                         ui.colored_label(egui::Color32::LIGHT_RED, &self.error);
                     }
