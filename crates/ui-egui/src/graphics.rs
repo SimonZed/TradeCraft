@@ -91,13 +91,10 @@ impl GraphicsBackend {
     }
 
     fn path() -> Option<std::path::PathBuf> {
-        Some(tradecraft_providers::settings::data_dir()?.join(
-            if cfg!(feature = "vibestrader-credential") {
-                "graphics-personal.json"
-            } else {
-                "graphics-community.json"
-            },
-        ))
+        Some(
+            tradecraft_providers::settings::data_dir()?
+                .join(build_files(cfg!(feature = "vibestrader-credential")).0),
+        )
     }
 
     pub(crate) fn load() -> Self {
@@ -120,6 +117,16 @@ impl GraphicsBackend {
         let data = serde_json::json!({"backend": self.key()});
         crate::terminal_storage::write_atomic(&path, &data.to_string())
             .map_err(|e| format!("Could not save graphics backend: {e}"))
+    }
+}
+
+/// The settings and crash-marker file names of a build, kept apart so that neither build
+/// reads or clears the other's marker.
+fn build_files(personal: bool) -> (&'static str, &'static str) {
+    if personal {
+        ("graphics-personal.json", "graphics-personal.marker")
+    } else {
+        ("graphics-community.json", "graphics-community.marker")
     }
 }
 
@@ -170,7 +177,10 @@ fn plan(
 }
 
 fn marker_path() -> Option<std::path::PathBuf> {
-    Some(tradecraft_providers::settings::data_dir()?.join("graphics-init.marker"))
+    Some(
+        tradecraft_providers::settings::data_dir()?
+            .join(build_files(cfg!(feature = "vibestrader-credential")).1),
+    )
 }
 
 /// The renderer configuration, with the backend request for the log.
@@ -249,6 +259,16 @@ pub(crate) fn log_adapter(state: Option<&eframe::egui_wgpu::RenderState>) {
 mod tests {
     use super::*;
     use GraphicsBackend::*;
+
+    #[test]
+    fn each_build_has_its_own_settings_and_marker() {
+        let (personal_settings, personal_marker) = build_files(true);
+        let (community_settings, community_marker) = build_files(false);
+        assert_ne!(personal_settings, community_settings);
+        assert_ne!(personal_marker, community_marker);
+        assert!(personal_marker.starts_with("graphics-personal"));
+        assert!(community_marker.starts_with("graphics-community"));
+    }
 
     #[test]
     fn available_backends_depend_on_the_operating_system() {
