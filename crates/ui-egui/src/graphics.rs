@@ -142,14 +142,14 @@ fn backend_key(backends: Option<Backends>) -> &'static str {
 }
 
 /// After a start that never finished initialising graphics, try DX12 and then OpenGL.
-/// Windows only; `None` means no fallback applies.
+/// The backend that failed is never chosen again by this fallback. Windows only; `None`
+/// means no fallback applies.
 fn fallback_after(previous_attempt: &str) -> Option<Backends> {
     if !cfg!(windows) {
         return None;
     }
     match previous_attempt {
         "dx12" => Some(Backends::GL),
-        "opengl" => None,
         _ => Some(Backends::DX12),
     }
 }
@@ -295,6 +295,23 @@ mod tests {
             }
             assert_eq!(GraphicsBackend::from_key(os, "nonsense"), Auto);
         }
+    }
+
+    #[test]
+    fn fallback_never_repeats_the_backend_that_failed() {
+        if !cfg!(windows) {
+            return;
+        }
+        // The saved setting is the backend that failed: the fallback must not reuse it.
+        assert_eq!(
+            plan(None, OpenGl, Some("opengl")),
+            (Some(Backends::DX12), true)
+        );
+        assert_eq!(plan(None, Dx12, Some("dx12")), (Some(Backends::GL), true));
+        assert_eq!(
+            plan(None, Vulkan, Some("vulkan")),
+            (Some(Backends::DX12), true)
+        );
     }
 
     #[test]
